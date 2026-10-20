@@ -1,4 +1,4 @@
-From 70c2a3e0a4783854f77d4e38fa82827e50573011 Mon Sep 17 00:00:00 2001
+From 361c6ef9ea74d83899332c1cae4692870429c5f5 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Tue, 20 Oct 2026 18:05:49 +0100
 Subject: [PATCH] feat(composer): usage burn-rate meter
@@ -13,21 +13,21 @@ get no button.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../chat/BurnRateMeter.logic.test.ts          | 150 +++++++++++
- .../components/chat/BurnRateMeter.logic.ts    | 171 +++++++++++++
- .../web/src/components/chat/BurnRateMeter.tsx | 238 ++++++++++++++++++
+ .../chat/BurnRateMeter.logic.test.ts          | 180 ++++++++++++++
+ .../components/chat/BurnRateMeter.logic.ts    | 208 ++++++++++++++++
+ .../web/src/components/chat/BurnRateMeter.tsx | 225 ++++++++++++++++++
  apps/web/src/components/chat/ChatComposer.tsx |   7 +
- 4 files changed, 566 insertions(+)
+ 4 files changed, 620 insertions(+)
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.test.ts
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.ts
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.tsx
 
 diff --git a/apps/web/src/components/chat/BurnRateMeter.logic.test.ts b/apps/web/src/components/chat/BurnRateMeter.logic.test.ts
 new file mode 100644
-index 0000000000..2cb4821ec5
+index 0000000000..62d53ff1a0
 --- /dev/null
 +++ b/apps/web/src/components/chat/BurnRateMeter.logic.test.ts
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,180 @@
 +import type { ServerProviderUsageWindow } from "@t3tools/contracts";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -37,6 +37,7 @@ index 0000000000..2cb4821ec5
 +  headlineBurn,
 +  paceTone,
 +  providerBurns,
++  recordReadings,
 +  recentRate,
 +  windowBurn,
 +} from "./BurnRateMeter.logic";
@@ -178,12 +179,41 @@ index 0000000000..2cb4821ec5
 +    expect(burns.map((burn) => burn.id)).toEqual(["five_hour", "seven_day"]);
 +  });
 +});
++
++describe("recordReadings", () => {
++  const report = (usedPercent: number, at: number) => ({
++    checkedAt: new Date(at).toISOString(),
++    windows: [sessionWindow(usedPercent, 2 * HOUR)],
++  });
++
++  it("appends changes and returns the same store when nothing moved", () => {
++    const first = recordReadings({}, "claude:me", report(10, NOW - 10 * MINUTE));
++    const again = recordReadings(first, "claude:me", report(10, NOW - 5 * MINUTE));
++    expect(again).toBe(first);
++    const next = recordReadings(first, "claude:me", report(12, NOW));
++    expect(Object.values(next)[0]?.map((sample) => sample.usedPercent)).toEqual([10, 12]);
++  });
++
++  it("drops this scope's finished windows but keeps other accounts", () => {
++    const other = recordReadings({}, "codex:other", report(5, NOW));
++    const mine = recordReadings(other, "claude:me", report(10, NOW));
++    const afterReset = recordReadings(mine, "claude:me", {
++      checkedAt: new Date(NOW).toISOString(),
++      windows: [
++        { ...sessionWindow(1, 5 * HOUR), resetsAt: new Date(NOW + 5 * HOUR).toISOString() },
++      ],
++    });
++    const keys = Object.keys(afterReset);
++    expect(keys.some((key) => key.startsWith("codex:other:"))).toBe(true);
++    expect(keys.filter((key) => key.startsWith("claude:me:"))).toHaveLength(1);
++  });
++});
 diff --git a/apps/web/src/components/chat/BurnRateMeter.logic.ts b/apps/web/src/components/chat/BurnRateMeter.logic.ts
 new file mode 100644
-index 0000000000..39730f2e70
+index 0000000000..493059a683
 --- /dev/null
 +++ b/apps/web/src/components/chat/BurnRateMeter.logic.ts
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,208 @@
 +import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
 +import { elapsedShare } from "@t3tools/shared/usageLimits";
 +
@@ -222,6 +252,43 @@ index 0000000000..39730f2e70
 +  readonly exhausted: boolean;
 +}
 +
++export type SampleStore = Readonly<Record<string, readonly UsageSample[]>>;
++
++/**
++ * Fold one usage report into the stored series. Returns the same object when
++ * nothing changed. Other scopes (accounts, environments) keep their series;
++ * this scope's finished windows are dropped.
++ */
++export function recordReadings(
++  store: SampleStore,
++  scope: string,
++  limits: ServerProviderUsageLimits | undefined,
++): SampleStore {
++  if (!limits || limits.unavailable) return store;
++  const at = Date.parse(limits.checkedAt);
++  if (!Number.isFinite(at)) return store;
++  let changed = false;
++  const next: Record<string, readonly UsageSample[]> = {};
++  const live = new Set<string>();
++  for (const window of limits.windows) {
++    const key = sampleKey(scope, window);
++    live.add(key);
++    const current = store[key] ?? [];
++    const updated = appendSample(current, { at, usedPercent: window.usedPercent });
++    if (updated !== current) changed = true;
++    next[key] = updated;
++  }
++  for (const [key, samples] of Object.entries(store)) {
++    if (live.has(key)) continue;
++    if (key.startsWith(`${scope}:`)) {
++      changed = true;
++      continue;
++    }
++    next[key] = samples;
++  }
++  return changed ? next : store;
++}
++
 +/** Stable per account window instance: a reset starts a fresh series. */
 +export function sampleKey(scope: string, window: ServerProviderUsageWindow): string {
 +  return `${scope}:${window.id}:${window.resetsAt ?? ""}`;
@@ -250,7 +317,7 @@ index 0000000000..39730f2e70
 +  const inWindow = samples.filter((entry) => entry.at >= now - RECENT_LOOKBACK_MS);
 +  // The reading just before the lookback anchors the start, so a single
 +  // jump inside it still counts.
-+  const before = samples.filter((entry) => entry.at < now - RECENT_LOOKBACK_MS).at(-1);
++  const before = samples.findLast((entry) => entry.at < now - RECENT_LOOKBACK_MS);
 +  const first = before ?? inWindow[0];
 +  const last = inWindow.at(-1) ?? before;
 +  if (!first || !last) return null;
@@ -357,38 +424,36 @@ index 0000000000..39730f2e70
 +}
 diff --git a/apps/web/src/components/chat/BurnRateMeter.tsx b/apps/web/src/components/chat/BurnRateMeter.tsx
 new file mode 100644
-index 0000000000..4cb782231a
+index 0000000000..bf82627f5b
 --- /dev/null
 +++ b/apps/web/src/components/chat/BurnRateMeter.tsx
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,225 @@
 +import type { ServerProvider } from "@t3tools/contracts";
 +import { formatDuration } from "@t3tools/shared/usageLimits";
 +import * as Schema from "effect/Schema";
 +import { FlameIcon } from "lucide-react";
-+import { useEffect, useMemo, useState } from "react";
++import { useEffect, useState, useSyncExternalStore } from "react";
 +
 +import { getLocalStorageItem, setLocalStorageItem } from "~/hooks/useLocalStorage";
 +import { cn } from "~/lib/utils";
 +import { Button } from "../ui/button";
 +import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 +import {
-+  appendSample,
 +  formatPace,
 +  headlineBurn,
 +  type PaceTone,
 +  paceTone,
 +  providerBurns,
++  recordReadings,
 +  RECENT_LOOKBACK_MS,
 +  sampleKey,
-+  type UsageSample,
++  type SampleStore,
 +  type WindowBurn,
 +} from "./BurnRateMeter.logic";
 +import { composerFloatingLayerProps } from "./composerEventScope";
 +
 +const SAMPLES_STORAGE_KEY = "t3code:burn-rate-samples:v1";
 +const TICK_MS = 30_000;
-+
-+type SampleStore = Record<string, readonly UsageSample[]>;
 +
 +const SampleStoreSchema = Schema.Record(
 +  Schema.String,
@@ -412,43 +477,35 @@ index 0000000000..4cb782231a
 +}
 +
 +/**
-+ * Every usage reading the composer sees, kept per window so the popover can
-+ * say how fast the last half hour went, not only the average since the window
-+ * opened. Readings persist across reloads; a reset starts a new key.
++ * Every usage reading any composer has seen, kept per window in localStorage
++ * so the popover can say how fast the last half hour went, not only the
++ * average since the window opened. Shared by every mounted meter.
 + */
-+function useUsageSamples(scope: string, windows: ServerProvider["usageLimits"]) {
-+  const [store, setStore] = useState<SampleStore>(readSamples);
-+  useEffect(() => {
-+    if (!windows || windows.unavailable) return;
-+    const at = Date.parse(windows.checkedAt) || Date.now();
-+    setStore((previous) => {
-+      let changed = false;
-+      const next: Record<string, readonly UsageSample[]> = {};
-+      const live = new Set<string>();
-+      for (const window of windows.windows) {
-+        const key = sampleKey(scope, window);
-+        live.add(key);
-+        const current = previous[key] ?? [];
-+        const updated = appendSample(current, { at, usedPercent: window.usedPercent });
-+        if (updated !== current) changed = true;
-+        next[key] = updated;
-+      }
-+      // Other scopes (accounts, environments) keep their series; only this
-+      // scope's finished windows are dropped.
-+      for (const [key, samples] of Object.entries(previous)) {
-+        if (live.has(key)) continue;
-+        if (key.startsWith(`${scope}:`)) {
-+          changed = true;
-+          continue;
-+        }
-+        next[key] = samples;
-+      }
-+      if (!changed) return previous;
-+      writeSamples(next);
-+      return next;
-+    });
-+  }, [scope, windows]);
-+  return store;
++let sampleStore: SampleStore | null = null;
++const sampleListeners = new Set<() => void>();
++
++function getSampleStore(): SampleStore {
++  sampleStore ??= readSamples();
++  return sampleStore;
++}
++
++function subscribeSamples(listener: () => void): () => void {
++  sampleListeners.add(listener);
++  return () => sampleListeners.delete(listener);
++}
++
++function recordSamples(scope: string, limits: ServerProvider["usageLimits"]): void {
++  const current = getSampleStore();
++  const next = recordReadings(current, scope, limits);
++  if (next === current) return;
++  sampleStore = next;
++  writeSamples(next);
++  for (const listener of sampleListeners) listener();
++}
++
++function useUsageSamples(scope: string, limits: ServerProvider["usageLimits"]): SampleStore {
++  useEffect(() => recordSamples(scope, limits), [scope, limits]);
++  return useSyncExternalStore(subscribeSamples, getSampleStore, getSampleStore);
 +}
 +
 +function useNow(intervalMs: number): number {
@@ -541,10 +598,7 @@ index 0000000000..4cb782231a
 +  const samples = useUsageSamples(scope, limits);
 +  const now = useNow(TICK_MS);
 +
-+  const burns = useMemo(
-+    () => providerBurns(limits, now, (window) => samples[sampleKey(scope, window)]),
-+    [limits, now, samples, scope],
-+  );
++  const burns = providerBurns(limits, now, (window) => samples[sampleKey(scope, window)]);
 +
 +  const headline = headlineBurn(burns);
 +  if (!headline) return null;
