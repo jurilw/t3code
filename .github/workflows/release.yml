@@ -65,7 +65,7 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 90
     env:
       TAG: ${{ needs.check.outputs.tag }}
