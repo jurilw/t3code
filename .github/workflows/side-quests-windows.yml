@@ -2,10 +2,12 @@ name: Side quests Windows build
 
 # Unsigned Windows x64 installer for this fork's composer additions (burn-rate
 # meter and dictation). No publish config is set, so the app never auto-updates
-# back to an upstream release. Run it by hand from the Actions tab.
+# back to an upstream release. Runs on every push to the side-quests branch, or by hand from the Actions tab.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [side-quests/composer-pace-dictation]
 
 permissions:
   contents: read
