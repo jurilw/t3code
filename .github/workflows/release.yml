@@ -1,0 +1,197 @@
+name: Release patched T3 Code
+
+# Follows upstream stable releases of pingdotgg/t3code. For each new one it
+# applies patches/*.patch, runs the patch's tests, builds the Windows x64
+# installer with this fork as its update feed, and publishes a release here
+# with the same version number. Installed copies then update from this repo
+# through T3 Code's normal "update available" flow.
+#
+# The server is untouched by the patches, so the app keeps using the official
+# server archive for SSH and WSL environments.
+#
+# If a patch no longer applies, the run fails (GitHub emails the repo owner)
+# and nothing is published; installed copies stay on the last good version.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build (defaults to the latest stable release)
+        required: false
+      force:
+        description: Rebuild even if this fork already has a release for the tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: patched-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: pingdotgg/t3code
+  # The public Clerk key the official app ships, so T3 account sign-in still works.
+  T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+  VITE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already released $tag."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building $tag."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Checkout upstream release
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.TAG }}
+          path: src
+
+      - name: Apply patches
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config user.name "side-quests-ci"
+          git config user.email "side-quests-ci@users.noreply.github.com"
+          for patch in ../ci/patches/*.patch; do
+            echo "Applying $patch"
+            git am --3way "$patch"
+          done
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: src/package.json
+          cache: false
+          run-install: false
+
+      - name: Install dependencies
+        working-directory: src
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts... --filter=@t3tools/web...
+
+      - name: Test the patch
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          vp test run apps/web/src/components/chat/BurnRateMeter.logic.test.ts
+          vp run --filter @t3tools/web typecheck
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Spectre-mitigated MSVC libs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) { exit 1 }
+
+      - name: Download official Linux server for the WSL backend
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p wsl-runtime
+          gh release download "$TAG" -R "$UPSTREAM" -D wsl-runtime \
+            -p "t3-$version-linux-x64.tar.gz" -p SHA256SUMS
+          (cd wsl-runtime && grep " \*\{0,1\}t3-$version-linux-x64.tar.gz$" SHA256SUMS | sha256sum -c -)
+
+      - name: Build installer
+        shell: bash
+        working-directory: src
+        env:
+          # Makes electron-builder emit latest.yml and point the app's updater here.
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          node scripts/update-release-package-versions.ts "$version"
+          node scripts/build-desktop-artifact.ts \
+            --platform win --target nsis --arch x64 \
+            --build-version "$version" \
+            --wsl-runtime "$GITHUB_WORKSPACE/wsl-runtime/t3-$version-linux-x64.tar.gz" \
+            --output-dir "$GITHUB_WORKSPACE/release"
+          ls -la "$GITHUB_WORKSPACE/release"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ env.TAG }}
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ env.TAG }}
+          path: release
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          upstream_sha="$(gh api "repos/$UPSTREAM/commits/$TAG" --jq .sha)"
+          notes="Official T3 Code $TAG plus the patches in this repo's patches/ folder (burn-rate meter).
+          Unsigned Windows x64 build: SmartScreen shows a warning on first install.
+          Upstream release notes: https://github.com/$UPSTREAM/releases/tag/$TAG"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "T3 Code $TAG + burn-rate meter" \
+            --notes "$notes" \
+            --target "$upstream_sha" \
+            --latest \
+            release/*

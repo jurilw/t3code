@@ -1,0 +1,643 @@
+From 70c2a3e0a4783854f77d4e38fa82827e50573011 Mon Sep 17 00:00:00 2001
+From: jurilw <washington.juri@gmail.com>
+Date: Tue, 20 Oct 2026 18:05:49 +0100
+Subject: [PATCH] feat(composer): usage burn-rate meter
+
+Shows how fast the selected provider's subscription quota is burning as a
+multiple of the even pace: 1x spends each window's quota at exactly the
+rate that reaches 100% at its reset. The button shows the hottest window;
+the popover lists every window with the average since it opened, the last
+30 minutes against what is left, and when the window runs out at the
+current average. Accounts without quota windows (API keys, metered plans)
+get no button.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../chat/BurnRateMeter.logic.test.ts          | 150 +++++++++++
+ .../components/chat/BurnRateMeter.logic.ts    | 171 +++++++++++++
+ .../web/src/components/chat/BurnRateMeter.tsx | 238 ++++++++++++++++++
+ apps/web/src/components/chat/ChatComposer.tsx |   7 +
+ 4 files changed, 566 insertions(+)
+ create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.test.ts
+ create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.ts
+ create mode 100644 apps/web/src/components/chat/BurnRateMeter.tsx
+
+diff --git a/apps/web/src/components/chat/BurnRateMeter.logic.test.ts b/apps/web/src/components/chat/BurnRateMeter.logic.test.ts
+new file mode 100644
+index 0000000000..2cb4821ec5
+--- /dev/null
++++ b/apps/web/src/components/chat/BurnRateMeter.logic.test.ts
+@@ -0,0 +1,150 @@
++import type { ServerProviderUsageWindow } from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  appendSample,
++  formatPace,
++  headlineBurn,
++  paceTone,
++  providerBurns,
++  recentRate,
++  windowBurn,
++} from "./BurnRateMeter.logic";
++
++const MINUTE = 60_000;
++const HOUR = 60 * MINUTE;
++const NOW = Date.parse("2026-10-19T12:00:00.000Z");
++
++function sessionWindow(usedPercent: number, msUntilReset: number): ServerProviderUsageWindow {
++  return {
++    id: "five_hour",
++    kind: "session",
++    label: "Session",
++    usedPercent,
++    resetsAt: new Date(NOW + msUntilReset).toISOString(),
++    windowDurationMins: 300,
++  };
++}
++
++describe("windowBurn", () => {
++  it("is 1x when spend matches the clock", () => {
++    // 2.5h of 5h gone, 50% used.
++    const burn = windowBurn(sessionWindow(50, 2.5 * HOUR), NOW);
++    expect(burn?.averagePace).toBeCloseTo(1);
++    expect(burn?.msUntilExhausted).toBeNull();
++  });
++
++  it("projects running out before the reset when ahead of pace", () => {
++    // 1h of 5h gone, 40% used: 2x, 60% left at 40%/h → 1.5h.
++    const burn = windowBurn(sessionWindow(40, 4 * HOUR), NOW);
++    expect(burn?.averagePace).toBeCloseTo(2);
++    expect(burn?.msUntilExhausted).toBeCloseTo(1.5 * HOUR);
++  });
++
++  it("holds the average back in the first moments of a window", () => {
++    const burn = windowBurn(sessionWindow(3, 5 * HOUR - MINUTE), NOW);
++    expect(burn?.averagePace).toBeNull();
++  });
++
++  it("measures the recent rate against what is left, not the whole window", () => {
++    // 50% used with 2.5h left: even is 20%/h. 10 points in the last 30m is 20%/h → 1x.
++    const samples = [
++      { at: NOW - 40 * MINUTE, usedPercent: 40 },
++      { at: NOW - 5 * MINUTE, usedPercent: 50 },
++    ];
++    const burn = windowBurn(sessionWindow(50, 2.5 * HOUR), NOW, samples);
++    expect(burn?.recentPace).toBeCloseTo(1);
++  });
++
++  it("marks a spent window as exhausted", () => {
++    const burn = windowBurn(sessionWindow(100, HOUR), NOW);
++    expect(burn?.exhausted).toBe(true);
++    expect(paceTone(burn?.averagePace ?? null, true)).toBe("hot");
++  });
++
++  it("needs a reset time and a length", () => {
++    expect(windowBurn({ ...sessionWindow(10, HOUR), resetsAt: undefined }, NOW)).toBeNull();
++  });
++});
++
++describe("samples", () => {
++  it("keeps only changes and ignores readings that go backwards", () => {
++    let samples = appendSample([], { at: NOW - 10 * MINUTE, usedPercent: 10 });
++    samples = appendSample(samples, { at: NOW - 9 * MINUTE, usedPercent: 10 });
++    samples = appendSample(samples, { at: NOW - 8 * MINUTE, usedPercent: 8 });
++    samples = appendSample(samples, { at: NOW - 7 * MINUTE, usedPercent: 12 });
++    expect(samples.map((sample) => sample.usedPercent)).toEqual([10, 12]);
++  });
++
++  it("decays the recent rate through a quiet stretch", () => {
++    const samples = [
++      { at: NOW - 20 * MINUTE, usedPercent: 10 },
++      { at: NOW - 15 * MINUTE, usedPercent: 20 },
++    ];
++    // 10 points over the 20 minutes since the first reading.
++    expect(recentRate(samples, NOW)).toBeCloseTo(10 / (20 * MINUTE));
++  });
++
++  it("needs a few minutes of history", () => {
++    expect(recentRate([{ at: NOW - MINUTE, usedPercent: 5 }], NOW)).toBeNull();
++  });
++});
++
++describe("presentation", () => {
++  it("headlines the hottest window", () => {
++    const session = windowBurn(sessionWindow(20, 4 * HOUR), NOW)!;
++    const weekly = windowBurn(
++      {
++        id: "seven_day",
++        kind: "weekly",
++        label: "Weekly",
++        usedPercent: 60,
++        resetsAt: new Date(NOW + 3.5 * 24 * HOUR).toISOString(),
++        windowDurationMins: 7 * 24 * 60,
++      },
++      NOW,
++    )!;
++    expect(headlineBurn([session, weekly])?.id).toBe("seven_day");
++  });
++
++  it("formats multiples", () => {
++    expect(formatPace(0.84)).toBe("0.8x");
++    expect(formatPace(1.46)).toBe("1.5x");
++    expect(formatPace(12.4)).toBe("12x");
++    expect(formatPace(null)).toBe("–");
++  });
++});
++
++describe("providerBurns", () => {
++  const checkedAt = new Date(NOW).toISOString();
++
++  it("is empty for accounts without quota windows, so the meter hides", () => {
++    expect(providerBurns(undefined, NOW)).toEqual([]);
++    expect(
++      providerBurns({ checkedAt, windows: [], unavailable: { reason: "unsupported" } }, NOW),
++    ).toEqual([]);
++    expect(providerBurns({ checkedAt, windows: [] }, NOW)).toEqual([]);
++  });
++
++  it("skips windows it cannot pace and orders session before weekly", () => {
++    const burns = providerBurns(
++      {
++        checkedAt,
++        windows: [
++          { id: "credits", kind: "other", label: "Credits", usedPercent: 10 },
++          {
++            id: "seven_day",
++            kind: "weekly",
++            label: "Weekly",
++            usedPercent: 30,
++            resetsAt: new Date(NOW + 3 * 24 * HOUR).toISOString(),
++            windowDurationMins: 7 * 24 * 60,
++          },
++          sessionWindow(20, 4 * HOUR),
++        ],
++      },
++      NOW,
++    );
++    expect(burns.map((burn) => burn.id)).toEqual(["five_hour", "seven_day"]);
++  });
++});
+diff --git a/apps/web/src/components/chat/BurnRateMeter.logic.ts b/apps/web/src/components/chat/BurnRateMeter.logic.ts
+new file mode 100644
+index 0000000000..39730f2e70
+--- /dev/null
++++ b/apps/web/src/components/chat/BurnRateMeter.logic.ts
+@@ -0,0 +1,171 @@
++import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
++import { elapsedShare } from "@t3tools/shared/usageLimits";
++
++/**
++ * Burn rate as a multiple of the even pace. 1x spends the window's quota at
++ * exactly the rate that reaches 100% at the reset; 2x runs dry halfway there.
++ */
++
++const MINUTE = 60_000;
++/** Below this share of a window the average is mostly noise from the first turn. */
++const MIN_ELAPSED_SHARE = 0.01;
++/** The "now" rate looks back this far, and needs at least the minimum span to say anything. */
++export const RECENT_LOOKBACK_MS = 30 * MINUTE;
++const RECENT_MIN_SPAN_MS = 5 * MINUTE;
++const MAX_SAMPLES_PER_WINDOW = 120;
++
++export interface UsageSample {
++  readonly at: number;
++  readonly usedPercent: number;
++}
++
++export interface WindowBurn {
++  readonly id: string;
++  readonly kind: ServerProviderUsageWindow["kind"];
++  readonly label: string;
++  readonly usedPercent: number;
++  /** Share of the window that has passed, 0..1. */
++  readonly elapsed: number;
++  readonly msUntilReset: number;
++  /** Used share over elapsed share since the window opened; null too early to tell. */
++  readonly averagePace: number | null;
++  /** Recent spend rate over the rate that lands exactly on 100% at reset. */
++  readonly recentPace: number | null;
++  /** At the average rate, how long until 100%; null when it would not run out first. */
++  readonly msUntilExhausted: number | null;
++  readonly exhausted: boolean;
++}
++
++/** Stable per account window instance: a reset starts a fresh series. */
++export function sampleKey(scope: string, window: ServerProviderUsageWindow): string {
++  return `${scope}:${window.id}:${window.resetsAt ?? ""}`;
++}
++
++/** Append one observation, dropping repeats and anything outside the lookback. */
++export function appendSample(
++  samples: readonly UsageSample[],
++  sample: UsageSample,
++): readonly UsageSample[] {
++  const last = samples.at(-1);
++  // Same reading again only moves the clock; keep the first so the span is honest.
++  if (last && last.usedPercent === sample.usedPercent) return samples;
++  // Usage never goes down inside one window; a drop means a stale reading arrived late.
++  if (last && sample.usedPercent < last.usedPercent) return samples;
++  const cutoff = sample.at - RECENT_LOOKBACK_MS * 2;
++  return [...samples.filter((entry) => entry.at >= cutoff), sample].slice(-MAX_SAMPLES_PER_WINDOW);
++}
++
++/**
++ * Percent per millisecond over the lookback. The span runs from the oldest
++ * reading in the lookback to now, so a quiet stretch since the last turn
++ * pulls the rate down instead of freezing it at its last value.
++ */
++export function recentRate(samples: readonly UsageSample[], now: number): number | null {
++  const inWindow = samples.filter((entry) => entry.at >= now - RECENT_LOOKBACK_MS);
++  // The reading just before the lookback anchors the start, so a single
++  // jump inside it still counts.
++  const before = samples.filter((entry) => entry.at < now - RECENT_LOOKBACK_MS).at(-1);
++  const first = before ?? inWindow[0];
++  const last = inWindow.at(-1) ?? before;
++  if (!first || !last) return null;
++  const start = Math.max(first.at, now - RECENT_LOOKBACK_MS);
++  const span = now - start;
++  if (span < RECENT_MIN_SPAN_MS) return null;
++  return Math.max(0, last.usedPercent - first.usedPercent) / span;
++}
++
++export function windowBurn(
++  window: ServerProviderUsageWindow,
++  now: number,
++  samples: readonly UsageSample[] = [],
++): WindowBurn | null {
++  const elapsed = elapsedShare(window, now);
++  const resetsAt = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
++  if (elapsed === null || !Number.isFinite(resetsAt)) return null;
++  const msUntilReset = Math.max(0, resetsAt - now);
++  const used = window.usedPercent;
++  const exhausted = used >= 100;
++  const averagePace = elapsed >= MIN_ELAPSED_SHARE ? used / (elapsed * 100) : null;
++
++  const rate = recentRate(samples, now);
++  const evenRate = msUntilReset > 0 ? (100 - used) / msUntilReset : null;
++  const recentPace =
++    exhausted || rate === null || evenRate === null || evenRate <= 0 ? null : rate / evenRate;
++
++  let msUntilExhausted: number | null = null;
++  const elapsedMs = elapsed * (window.windowDurationMins ?? 0) * MINUTE;
++  if (!exhausted && used > 0 && elapsedMs > 0) {
++    const eta = ((100 - used) / used) * elapsedMs;
++    if (eta < msUntilReset) msUntilExhausted = eta;
++  }
++
++  return {
++    id: window.id,
++    kind: window.kind,
++    label: window.label,
++    usedPercent: used,
++    elapsed,
++    msUntilReset,
++    averagePace,
++    recentPace,
++    msUntilExhausted: exhausted ? 0 : msUntilExhausted,
++    exhausted,
++  };
++}
++
++const KIND_ORDER: Record<ServerProviderUsageWindow["kind"], number> = {
++  session: 0,
++  weekly: 1,
++  monthly: 2,
++  other: 3,
++};
++
++export function sortBurns(burns: readonly WindowBurn[]): WindowBurn[] {
++  return [...burns].sort((a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind]);
++}
++
++/**
++ * Every window that can be paced, hottest first by kind. Empty for API-key and
++ * metered accounts (no quota windows), which hides the meter entirely.
++ */
++export function providerBurns(
++  limits: ServerProviderUsageLimits | undefined,
++  now: number,
++  samplesFor: (window: ServerProviderUsageWindow) => readonly UsageSample[] | undefined = () =>
++    undefined,
++): WindowBurn[] {
++  if (!limits || limits.unavailable) return [];
++  return sortBurns(
++    limits.windows.flatMap((window) => {
++      const burn = windowBurn(window, now, samplesFor(window));
++      return burn ? [burn] : [];
++    }),
++  );
++}
++
++/** The window to show on the button: whichever is burning hottest against its clock. */
++export function headlineBurn(burns: readonly WindowBurn[]): WindowBurn | null {
++  let best: WindowBurn | null = null;
++  for (const burn of burns) {
++    if (burn.exhausted) return burn;
++    if (burn.averagePace === null) continue;
++    if (!best || (best.averagePace ?? 0) < burn.averagePace) best = burn;
++  }
++  return best ?? burns[0] ?? null;
++}
++
++/** `0.8x`, `1.4x`, `12x`. */
++export function formatPace(pace: number | null): string {
++  if (pace === null || !Number.isFinite(pace)) return "–";
++  if (pace >= 10) return `${Math.round(pace)}x`;
++  return `${pace.toFixed(1)}x`;
++}
++
++export type PaceTone = "calm" | "warm" | "hot";
++
++/** Within 10% of even is fine; past 1.5x the window will clearly run out early. */
++export function paceTone(pace: number | null, exhausted = false): PaceTone {
++  if (exhausted) return "hot";
++  if (pace === null || pace <= 1.1) return "calm";
++  return pace <= 1.5 ? "warm" : "hot";
++}
+diff --git a/apps/web/src/components/chat/BurnRateMeter.tsx b/apps/web/src/components/chat/BurnRateMeter.tsx
+new file mode 100644
+index 0000000000..4cb782231a
+--- /dev/null
++++ b/apps/web/src/components/chat/BurnRateMeter.tsx
+@@ -0,0 +1,238 @@
++import type { ServerProvider } from "@t3tools/contracts";
++import { formatDuration } from "@t3tools/shared/usageLimits";
++import * as Schema from "effect/Schema";
++import { FlameIcon } from "lucide-react";
++import { useEffect, useMemo, useState } from "react";
++
++import { getLocalStorageItem, setLocalStorageItem } from "~/hooks/useLocalStorage";
++import { cn } from "~/lib/utils";
++import { Button } from "../ui/button";
++import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
++import {
++  appendSample,
++  formatPace,
++  headlineBurn,
++  type PaceTone,
++  paceTone,
++  providerBurns,
++  RECENT_LOOKBACK_MS,
++  sampleKey,
++  type UsageSample,
++  type WindowBurn,
++} from "./BurnRateMeter.logic";
++import { composerFloatingLayerProps } from "./composerEventScope";
++
++const SAMPLES_STORAGE_KEY = "t3code:burn-rate-samples:v1";
++const TICK_MS = 30_000;
++
++type SampleStore = Record<string, readonly UsageSample[]>;
++
++const SampleStoreSchema = Schema.Record(
++  Schema.String,
++  Schema.Array(Schema.Struct({ at: Schema.Number, usedPercent: Schema.Number })),
++);
++
++function readSamples(): SampleStore {
++  try {
++    return getLocalStorageItem(SAMPLES_STORAGE_KEY, SampleStoreSchema) ?? {};
++  } catch {
++    return {};
++  }
++}
++
++function writeSamples(store: SampleStore): void {
++  try {
++    setLocalStorageItem(SAMPLES_STORAGE_KEY, store, SampleStoreSchema);
++  } catch {
++    // Storage full or blocked: the recent rate just stays unknown.
++  }
++}
++
++/**
++ * Every usage reading the composer sees, kept per window so the popover can
++ * say how fast the last half hour went, not only the average since the window
++ * opened. Readings persist across reloads; a reset starts a new key.
++ */
++function useUsageSamples(scope: string, windows: ServerProvider["usageLimits"]) {
++  const [store, setStore] = useState<SampleStore>(readSamples);
++  useEffect(() => {
++    if (!windows || windows.unavailable) return;
++    const at = Date.parse(windows.checkedAt) || Date.now();
++    setStore((previous) => {
++      let changed = false;
++      const next: Record<string, readonly UsageSample[]> = {};
++      const live = new Set<string>();
++      for (const window of windows.windows) {
++        const key = sampleKey(scope, window);
++        live.add(key);
++        const current = previous[key] ?? [];
++        const updated = appendSample(current, { at, usedPercent: window.usedPercent });
++        if (updated !== current) changed = true;
++        next[key] = updated;
++      }
++      // Other scopes (accounts, environments) keep their series; only this
++      // scope's finished windows are dropped.
++      for (const [key, samples] of Object.entries(previous)) {
++        if (live.has(key)) continue;
++        if (key.startsWith(`${scope}:`)) {
++          changed = true;
++          continue;
++        }
++        next[key] = samples;
++      }
++      if (!changed) return previous;
++      writeSamples(next);
++      return next;
++    });
++  }, [scope, windows]);
++  return store;
++}
++
++function useNow(intervalMs: number): number {
++  const [now, setNow] = useState(() => Date.now());
++  useEffect(() => {
++    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
++    return () => window.clearInterval(id);
++  }, [intervalMs]);
++  return now;
++}
++
++const TONE_TEXT: Record<PaceTone, string> = {
++  calm: "text-muted-foreground",
++  warm: "text-warning",
++  hot: "text-destructive",
++};
++
++const TONE_FILL: Record<PaceTone, string> = {
++  calm: "bg-muted-foreground/60",
++  warm: "bg-warning",
++  hot: "bg-destructive",
++};
++
++function describeBurn(burn: WindowBurn): string {
++  if (burn.exhausted) return `Limit reached · resets in ${formatDuration(burn.msUntilReset)}`;
++  if (burn.msUntilExhausted !== null) {
++    return `At this average you hit 100% in ${formatDuration(burn.msUntilExhausted)}, ${formatDuration(
++      burn.msUntilReset - burn.msUntilExhausted,
++    )} before the reset`;
++  }
++  return `Resets in ${formatDuration(burn.msUntilReset)} with room to spare`;
++}
++
++function BurnRow({ burn }: { readonly burn: WindowBurn }) {
++  const averageTone = paceTone(burn.averagePace, burn.exhausted);
++  const recentTone = paceTone(burn.recentPace);
++  const used = Math.max(0, Math.min(100, burn.usedPercent));
++  return (
++    <div className="flex flex-col gap-1.5">
++      <div className="flex items-baseline justify-between gap-3">
++        <span className="font-medium text-xs">{burn.label}</span>
++        <span className="flex items-baseline gap-2 tabular-nums">
++          {burn.exhausted ? null : (
++            <span className="text-2xs text-secondary-label">
++              now{" "}
++              <span className={cn("font-medium", TONE_TEXT[recentTone])}>
++                {formatPace(burn.recentPace)}
++              </span>
++            </span>
++          )}
++          <span className={cn("font-semibold text-sm", TONE_TEXT[averageTone])}>
++            {burn.exhausted ? "maxed" : formatPace(burn.averagePace)}
++          </span>
++        </span>
++      </div>
++      {/* Fill is quota spent; the hairline is the clock, where 1x would put the fill. */}
++      <div
++        className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted/60"
++        role="img"
++        aria-label={`${Math.round(used)}% used, ${Math.round(burn.elapsed * 100)}% of the window elapsed`}
++      >
++        <div
++          className={cn(
++            "h-full rounded-full transition-[width] duration-500",
++            TONE_FILL[averageTone],
++          )}
++          style={{ width: `${used}%` }}
++        />
++        <div
++          className="absolute inset-y-0 w-px bg-foreground/70"
++          style={{ left: `${Math.round(burn.elapsed * 100)}%` }}
++        />
++      </div>
++      <div className="text-2xs text-secondary-label tabular-nums">
++        {Math.round(used)}% used · {Math.round(burn.elapsed * 100)}% of the window elapsed
++      </div>
++      <div className="text-pretty text-2xs text-secondary-label">{describeBurn(burn)}</div>
++    </div>
++  );
++}
++
++/**
++ * Footer button showing how fast the selected provider's quota is burning,
++ * as a multiple of the pace that would land on exactly 100% at each window's
++ * reset. The button shows the hottest window; the popover shows them all.
++ */
++export function BurnRateMeter({ provider }: { readonly provider: ServerProvider }) {
++  const limits = provider.usageLimits;
++  const scope = `${provider.instanceId}:${provider.auth.email ?? ""}`;
++  const samples = useUsageSamples(scope, limits);
++  const now = useNow(TICK_MS);
++
++  const burns = useMemo(
++    () => providerBurns(limits, now, (window) => samples[sampleKey(scope, window)]),
++    [limits, now, samples, scope],
++  );
++
++  const headline = headlineBurn(burns);
++  if (!headline) return null;
++  const tone = paceTone(headline.averagePace, headline.exhausted);
++
++  return (
++    <Popover>
++      <PopoverTrigger
++        openOnHover
++        delay={150}
++        closeDelay={150}
++        render={
++          <Button
++            type="button"
++            size="xs"
++            variant="ghost-muted"
++            onPointerDown={(event) => event.preventDefault()}
++            aria-label={`Usage burn rate ${formatPace(headline.averagePace)} on ${headline.label}`}
++          >
++            <span className={cn("inline-flex items-center gap-1 tabular-nums", TONE_TEXT[tone])}>
++              <FlameIcon aria-hidden="true" className="size-3.5" />
++              <span className="text-xs font-medium">
++                {headline.exhausted ? "max" : formatPace(headline.averagePace)}
++              </span>
++            </span>
++          </Button>
++        }
++      />
++      <PopoverPopup
++        {...composerFloatingLayerProps}
++        tooltipStyle
++        side="top"
++        align="end"
++        padding="none"
++        width="md"
++        className="text-left whitespace-normal"
++      >
++        <div className="flex flex-col gap-3 p-(--floating-content-inset)">
++          <div className="flex items-center justify-between gap-3">
++            <div className="font-medium text-muted-foreground text-xs">Burn rate</div>
++            <div className="text-2xs text-secondary-label">1x lands on 100% at the reset</div>
++          </div>
++          {burns.map((burn) => (
++            <BurnRow key={burn.id} burn={burn} />
++          ))}
++          <div className="text-pretty text-2xs text-secondary-label">
++            Big number: average since the window opened. Now: the last {RECENT_LOOKBACK_MS / 60_000}{" "}
++            minutes against what is left.
++          </div>
++        </div>
++      </PopoverPopup>
++    </Popover>
++  );
++}
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 822e79da8d..7f180311f7 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -311,6 +311,7 @@ import {
+   renderProviderTraitsMenuContent,
+   renderProviderTraitsPicker,
+ } from "./composerProviderState";
++import { BurnRateMeter } from "./BurnRateMeter";
+ import { ContextWindowMeter, ContextWindowMeterPlaceholder } from "./ContextWindowMeter";
+ import {
+   providerSupportsManualCompaction,
+@@ -1384,6 +1385,8 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
+   canOperateThread: boolean;
+   activeContextWindow: ContextWindowSnapshot | null;
+   reserveContextWindowMeter: boolean;
++  /** Subscription quota to pace against; providers without windows show nothing. */
++  usageLimitsProvider: ServerProvider | null;
+   activeThreadModelDisplayName: string | null;
+   isPreparingWorktree: boolean;
+   pendingAction: {
+@@ -1421,6 +1424,9 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
+ }) {
+   return (
+     <>
++      {props.usageLimitsProvider?.usageLimits ? (
++        <BurnRateMeter provider={props.usageLimitsProvider} />
++      ) : null}
+       {props.activeContextWindow ? (
+         <ContextWindowMeter
+           usage={props.activeContextWindow}
+@@ -7601,6 +7607,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+                       settings.contextWindowMeterEnabled ? activeContextWindow : null
+                     }
+                     reserveContextWindowMeter={reserveContextWindowMeter}
++                    usageLimitsProvider={isComposerResting ? null : selectedProviderStatus}
+                     activeThreadModelDisplayName={activeThreadModelDisplayName}
+                     pendingAction={pendingPrimaryAction}
+                     isRunning={phase === "running"}
+-- 
+2.43.0
+
