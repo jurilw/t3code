@@ -1093,6 +1093,11 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => JSON.stringify([environmentId, input]),
       },
     }),
+    // Dictation clips are independent; a second one must not wait on the first.
+    transcribeAudio: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:transcribe-audio",
+      tag: WS_METHODS.serverTranscribeAudio,
+    }),
     refreshProviders: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:refresh-providers",
       tag: WS_METHODS.serverRefreshProviders,

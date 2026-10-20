@@ -937,6 +937,8 @@ import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
+import { BurnRateMeter } from "./BurnRateMeter";
+import { DictationButton } from "./DictationButton";
 import {
   FileIcon,
   BotIcon,
@@ -5731,6 +5733,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [expandMobileComposer, insertComposerText, isComposerCollapsedMobile],
   );
 
+  const insertDictatedText = useCallback(
+    (text: string) => {
+      if (!insertComposerText(`${text} `, "cursor", { ensureLeadingBoundary: true })) {
+        toastManager.add({
+          type: "error",
+          title: "Unable to add dictation",
+          description: "The composer is busy; try again once it is ready.",
+        });
+      }
+    },
+    [insertComposerText],
+  );
+
   // Context produced by other panels (diff comments, preview picks) asks the store to place
   // its chip; while this composer is mounted for the draft, that means the caret.
   const insertContextReferencesAtCaret = useCallback(
@@ -7005,6 +7020,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   }
                   className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
                 >
+                  {isComposerResting ? null : (
+                    <>
+                      {selectedProviderStatus?.usageLimits ? (
+                        <BurnRateMeter provider={selectedProviderStatus} />
+                      ) : null}
+                      <DictationButton
+                        environmentId={environmentId}
+                        disabled={environmentUnavailable !== null}
+                        onTranscript={insertDictatedText}
+                      />
+                    </>
+                  )}
                   {showComposerAttachAction ? (
                     <>
                       <input

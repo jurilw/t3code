@@ -183,6 +183,7 @@ import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
+import { transcribeAudio } from "./transcription/whisperTranscriber.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -2752,6 +2753,10 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "provider" },
           ),
+        [WS_METHODS.serverTranscribeAudio]: (input) =>
+          observeRpcEffect(WS_METHODS.serverTranscribeAudio, transcribeAudio(input), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.providerAuthStart]: (input) =>
           observeRpcEffect(
             WS_METHODS.providerAuthStart,
