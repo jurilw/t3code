@@ -1,4 +1,4 @@
-From 361c6ef9ea74d83899332c1cae4692870429c5f5 Mon Sep 17 00:00:00 2001
+From 9cb7badc26f11031b8ebe28c8b32f24080013a21 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Tue, 20 Oct 2026 18:05:49 +0100
 Subject: [PATCH] feat(composer): usage burn-rate meter
@@ -13,21 +13,21 @@ get no button.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../chat/BurnRateMeter.logic.test.ts          | 180 ++++++++++++++
- .../components/chat/BurnRateMeter.logic.ts    | 208 ++++++++++++++++
- .../web/src/components/chat/BurnRateMeter.tsx | 225 ++++++++++++++++++
+ .../chat/BurnRateMeter.logic.test.ts          | 208 +++++++++++++++
+ .../components/chat/BurnRateMeter.logic.ts    | 248 ++++++++++++++++++
+ .../web/src/components/chat/BurnRateMeter.tsx | 228 ++++++++++++++++
  apps/web/src/components/chat/ChatComposer.tsx |   7 +
- 4 files changed, 620 insertions(+)
+ 4 files changed, 691 insertions(+)
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.test.ts
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.ts
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.tsx
 
 diff --git a/apps/web/src/components/chat/BurnRateMeter.logic.test.ts b/apps/web/src/components/chat/BurnRateMeter.logic.test.ts
 new file mode 100644
-index 0000000000..62d53ff1a0
+index 0000000000..b44519ca64
 --- /dev/null
 +++ b/apps/web/src/components/chat/BurnRateMeter.logic.test.ts
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,208 @@
 +import type { ServerProviderUsageWindow } from "@t3tools/contracts";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -181,39 +181,67 @@ index 0000000000..62d53ff1a0
 +});
 +
 +describe("recordReadings", () => {
-+  const report = (usedPercent: number, at: number) => ({
-+    checkedAt: new Date(at).toISOString(),
-+    windows: [sessionWindow(usedPercent, 2 * HOUR)],
++  const report = (usedPercent: number, resetsAt: string) => ({
++    // Deliberately stale: readings are stamped with the observation time.
++    checkedAt: new Date(NOW - 6 * HOUR).toISOString(),
++    windows: [{ ...sessionWindow(usedPercent, 2 * HOUR), resetsAt }],
++  });
++  const reset = new Date(NOW + 2 * HOUR);
++  const probeReset = new Date(reset.getTime() + 812).toISOString();
++  const eventReset = reset.toISOString();
++
++  it("keeps one series when the same reset arrives with different precision", () => {
++    let store = recordReadings({}, "claude:me", report(10, probeReset), NOW - 20 * MINUTE);
++    store = recordReadings(store, "claude:me", report(14, eventReset), NOW - 10 * MINUTE);
++    store = recordReadings(store, "claude:me", report(18, probeReset), NOW);
++    const series = Object.values(store);
++    expect(series).toHaveLength(1);
++    expect(series[0]?.samples.map((sample) => sample.at)).toEqual([
++      NOW - 20 * MINUTE,
++      NOW - 10 * MINUTE,
++      NOW,
++    ]);
++    // 8 points over 20 minutes with 82% left over 2h: 24%/h vs 41%/h.
++    const burn = windowBurn(sessionWindow(18, 2 * HOUR), NOW, series[0]?.samples);
++    expect(burn?.recentPace).toBeCloseTo(24 / 41, 1);
 +  });
 +
-+  it("appends changes and returns the same store when nothing moved", () => {
-+    const first = recordReadings({}, "claude:me", report(10, NOW - 10 * MINUTE));
-+    const again = recordReadings(first, "claude:me", report(10, NOW - 5 * MINUTE));
-+    expect(again).toBe(first);
-+    const next = recordReadings(first, "claude:me", report(12, NOW));
-+    expect(Object.values(next)[0]?.map((sample) => sample.usedPercent)).toEqual([10, 12]);
++  it("returns the same store when nothing moved", () => {
++    const first = recordReadings({}, "claude:me", report(10, eventReset), NOW - 10 * MINUTE);
++    expect(recordReadings(first, "claude:me", report(10, probeReset), NOW)).toBe(first);
 +  });
 +
-+  it("drops this scope's finished windows but keeps other accounts", () => {
-+    const other = recordReadings({}, "codex:other", report(5, NOW));
-+    const mine = recordReadings(other, "claude:me", report(10, NOW));
-+    const afterReset = recordReadings(mine, "claude:me", {
-+      checkedAt: new Date(NOW).toISOString(),
-+      windows: [
-+        { ...sessionWindow(1, 5 * HOUR), resetsAt: new Date(NOW + 5 * HOUR).toISOString() },
-+      ],
-+    });
-+    const keys = Object.keys(afterReset);
-+    expect(keys.some((key) => key.startsWith("codex:other:"))).toBe(true);
-+    expect(keys.filter((key) => key.startsWith("claude:me:"))).toHaveLength(1);
++  it("starts over at a real reset and keeps other accounts", () => {
++    let store = recordReadings({}, "codex:other", report(5, eventReset), NOW);
++    store = recordReadings(store, "claude:me", report(80, eventReset), NOW - 10 * MINUTE);
++    const nextWindow = new Date(reset.getTime() + 5 * HOUR).toISOString();
++    store = recordReadings(store, "claude:me", report(2, nextWindow), NOW);
++    expect(store["claude:me:five_hour"]?.samples.map((sample) => sample.usedPercent)).toEqual([2]);
++    expect(store["codex:other:five_hour"]).toBeDefined();
++  });
++
++  it("ignores accounts without quota windows", () => {
++    const store = {};
++    expect(
++      recordReadings(
++        store,
++        "claude:me",
++        {
++          checkedAt: new Date(NOW).toISOString(),
++          windows: [],
++          unavailable: { reason: "unsupported" },
++        },
++        NOW,
++      ),
++    ).toBe(store);
 +  });
 +});
 diff --git a/apps/web/src/components/chat/BurnRateMeter.logic.ts b/apps/web/src/components/chat/BurnRateMeter.logic.ts
 new file mode 100644
-index 0000000000..493059a683
+index 0000000000..4a978441f9
 --- /dev/null
 +++ b/apps/web/src/components/chat/BurnRateMeter.logic.ts
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,248 @@
 +import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
 +import { elapsedShare } from "@t3tools/shared/usageLimits";
 +
@@ -252,46 +280,86 @@ index 0000000000..493059a683
 +  readonly exhausted: boolean;
 +}
 +
-+export type SampleStore = Readonly<Record<string, readonly UsageSample[]>>;
++/** One window's readings since it last reset. */
++export interface SampleSeries {
++  /** The reset this series belongs to, epoch ms; null when the provider did not say. */
++  readonly resetsAt: number | null;
++  readonly samples: readonly UsageSample[];
++}
++
++export type SampleStore = Readonly<Record<string, SampleSeries>>;
 +
 +/**
-+ * Fold one usage report into the stored series. Returns the same object when
-+ * nothing changed. Other scopes (accounts, environments) keep their series;
-+ * this scope's finished windows are dropped.
++ * Providers report the same reset with different precision depending on the
++ * source (Claude's usage probe has fractional seconds, its streamed events do
++ * not), so a reset only counts as new once it moves by more than this.
++ */
++const RESET_TOLERANCE_MS = 30 * MINUTE;
++
++function parseReset(window: ServerProviderUsageWindow): number | null {
++  const parsed = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
++  return Number.isFinite(parsed) ? parsed : null;
++}
++
++function isNewWindow(series: SampleSeries, resetsAt: number | null, usedPercent: number): boolean {
++  if (resetsAt !== null && series.resetsAt !== null) {
++    if (Math.abs(resetsAt - series.resetsAt) > RESET_TOLERANCE_MS) return true;
++  }
++  // A large drop with no reset time to compare means the window rolled over.
++  const last = series.samples.at(-1);
++  return last !== undefined && usedPercent < last.usedPercent - 5;
++}
++
++/**
++ * Fold one usage report into the stored series. Readings are stamped with
++ * when this client saw them (`now`), not the report's `checkedAt`: streamed
++ * updates merge into a snapshot whose `checkedAt` can be much older. Returns
++ * the same object when nothing changed. Other scopes keep their series; this
++ * scope's windows that are no longer reported are dropped.
 + */
 +export function recordReadings(
 +  store: SampleStore,
 +  scope: string,
 +  limits: ServerProviderUsageLimits | undefined,
++  now: number,
 +): SampleStore {
 +  if (!limits || limits.unavailable) return store;
-+  const at = Date.parse(limits.checkedAt);
-+  if (!Number.isFinite(at)) return store;
 +  let changed = false;
-+  const next: Record<string, readonly UsageSample[]> = {};
++  const next: Record<string, SampleSeries> = {};
 +  const live = new Set<string>();
 +  for (const window of limits.windows) {
 +    const key = sampleKey(scope, window);
 +    live.add(key);
-+    const current = store[key] ?? [];
-+    const updated = appendSample(current, { at, usedPercent: window.usedPercent });
-+    if (updated !== current) changed = true;
-+    next[key] = updated;
++    const resetsAt = parseReset(window);
++    const current = store[key];
++    const sample = { at: now, usedPercent: window.usedPercent };
++    if (!current || isNewWindow(current, resetsAt, window.usedPercent)) {
++      next[key] = { resetsAt, samples: [sample] };
++      changed = true;
++      continue;
++    }
++    const samples = appendSample(current.samples, sample);
++    if (samples === current.samples) {
++      next[key] = current;
++      continue;
++    }
++    next[key] = { resetsAt: resetsAt ?? current.resetsAt, samples };
++    changed = true;
 +  }
-+  for (const [key, samples] of Object.entries(store)) {
++  for (const [key, series] of Object.entries(store)) {
 +    if (live.has(key)) continue;
 +    if (key.startsWith(`${scope}:`)) {
 +      changed = true;
 +      continue;
 +    }
-+    next[key] = samples;
++    next[key] = series;
 +  }
 +  return changed ? next : store;
 +}
 +
-+/** Stable per account window instance: a reset starts a fresh series. */
++/** One series per account window; resets are detected from the data, not the key. */
 +export function sampleKey(scope: string, window: ServerProviderUsageWindow): string {
-+  return `${scope}:${window.id}:${window.resetsAt ?? ""}`;
++  return `${scope}:${window.id}`;
 +}
 +
 +/** Append one observation, dropping repeats and anything outside the lookback. */
@@ -424,10 +492,10 @@ index 0000000000..493059a683
 +}
 diff --git a/apps/web/src/components/chat/BurnRateMeter.tsx b/apps/web/src/components/chat/BurnRateMeter.tsx
 new file mode 100644
-index 0000000000..bf82627f5b
+index 0000000000..43b3dba72b
 --- /dev/null
 +++ b/apps/web/src/components/chat/BurnRateMeter.tsx
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,228 @@
 +import type { ServerProvider } from "@t3tools/contracts";
 +import { formatDuration } from "@t3tools/shared/usageLimits";
 +import * as Schema from "effect/Schema";
@@ -452,12 +520,15 @@ index 0000000000..bf82627f5b
 +} from "./BurnRateMeter.logic";
 +import { composerFloatingLayerProps } from "./composerEventScope";
 +
-+const SAMPLES_STORAGE_KEY = "t3code:burn-rate-samples:v1";
++const SAMPLES_STORAGE_KEY = "t3code:burn-rate-samples:v2";
 +const TICK_MS = 30_000;
 +
 +const SampleStoreSchema = Schema.Record(
 +  Schema.String,
-+  Schema.Array(Schema.Struct({ at: Schema.Number, usedPercent: Schema.Number })),
++  Schema.Struct({
++    resetsAt: Schema.NullOr(Schema.Number),
++    samples: Schema.Array(Schema.Struct({ at: Schema.Number, usedPercent: Schema.Number })),
++  }),
 +);
 +
 +function readSamples(): SampleStore {
@@ -496,7 +567,7 @@ index 0000000000..bf82627f5b
 +
 +function recordSamples(scope: string, limits: ServerProvider["usageLimits"]): void {
 +  const current = getSampleStore();
-+  const next = recordReadings(current, scope, limits);
++  const next = recordReadings(current, scope, limits, Date.now());
 +  if (next === current) return;
 +  sampleStore = next;
 +  writeSamples(next);
@@ -598,7 +669,7 @@ index 0000000000..bf82627f5b
 +  const samples = useUsageSamples(scope, limits);
 +  const now = useNow(TICK_MS);
 +
-+  const burns = providerBurns(limits, now, (window) => samples[sampleKey(scope, window)]);
++  const burns = providerBurns(limits, now, (window) => samples[sampleKey(scope, window)]?.samples);
 +
 +  const headline = headlineBurn(burns);
 +  if (!headline) return null;
