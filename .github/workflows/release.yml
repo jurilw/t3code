@@ -184,14 +184,16 @@ jobs:
       - name: Publish release
         run: |
           set -euo pipefail
-          upstream_sha="$(gh api "repos/$UPSTREAM/commits/$TAG" --jq .sha)"
           notes="Official T3 Code $TAG plus the patches in this repo's patches/ folder (burn-rate meter).
           Unsigned Windows x64 build: SmartScreen shows a warning on first install.
           Upstream release notes: https://github.com/$UPSTREAM/releases/tag/$TAG"
+          # Tag this repo's own commit: tagging the upstream commit fails with
+          # HTTP 403 whenever that release touched .github/workflows, because
+          # GITHUB_TOKEN cannot have the workflows permission.
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --title "T3 Code $TAG + burn-rate meter" \
             --notes "$notes" \
-            --target "$upstream_sha" \
+            --target "$GITHUB_SHA" \
             --latest \
             release/*
