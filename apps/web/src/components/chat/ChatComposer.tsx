@@ -939,6 +939,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import { BurnRateMeter } from "./BurnRateMeter";
 import { DictationButton } from "./DictationButton";
+import { useIsDictating } from "./dictationSession";
 import {
   FileIcon,
   BotIcon,
@@ -4728,7 +4729,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Banners and the tasks badge dock above the surface rather than inside
   // it, so they do not hold the composer open; only surface-internal chrome
   // does.
+  // An active dictation holds the composer open so its stop button (and the
+  // recording timer) never disappear under a timeline scroll.
+  const isDictating = useIsDictating();
   const composerHasExpandedChrome =
+    isDictating ||
     showComposerTopDrawer ||
     isTasksDrawerOpen ||
     composerMenuOpen ||
@@ -5733,16 +5738,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [expandMobileComposer, insertComposerText, isComposerCollapsedMobile],
   );
 
+  // Returns false when the composer cannot take the text; the dictation
+  // session then keeps it pending (and on the clipboard) instead of dropping it.
   const insertDictatedText = useCallback(
-    (text: string) => {
-      if (!insertComposerText(`${text} `, "cursor", { ensureLeadingBoundary: true })) {
-        toastManager.add({
-          type: "error",
-          title: "Unable to add dictation",
-          description: "The composer is busy; try again once it is ready.",
-        });
-      }
-    },
+    (text: string): boolean =>
+      insertComposerText(`${text} `, "cursor", { ensureLeadingBoundary: true }),
     [insertComposerText],
   );
 
@@ -7027,6 +7027,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       ) : null}
                       <DictationButton
                         environmentId={environmentId}
+                        composerKey={composerDraftTargetKey}
                         disabled={environmentUnavailable !== null}
                         onTranscript={insertDictatedText}
                       />
