@@ -1,0 +1,560 @@
+From 33031b36c02b6a0b4dc876a4219c647047d8f277 Mon Sep 17 00:00:00 2001
+From: jurilw <washington.juri@gmail.com>
+Date: Sun, 25 Oct 2026 13:41:17 +0000
+Subject: [PATCH 3/3] fix(persistence): import V1 threads created after the V2
+ snapshot
+
+statev2.sqlite is seeded from state.sqlite only when it does not exist.
+After V2 -> V1 (0.0.x) -> V2, every thread made in the V1 build lives only
+in state.sqlite, and V2 never reads that file again: the threads vanish
+from the sidebar although nothing is lost. (Seen on a real install: 0.1.0
+created statev2 on 10-20, 0.0.45 builds then added 4 threads and 6
+projects, 0.1.1 showed none of them.)
+
+On startup, when both files exist, copy into statev2's legacy projection
+tables the V1 projects, threads, messages and pull-request links whose ids
+V2 has never seen; LegacyV1ThreadImporter then imports them exactly like
+snapshot threads (shells at startup, transcripts lazily).
+
+- Never modifies state.sqlite (opened read-only, like the snapshot).
+- Skips V1-deleted threads and anything V2 already has; edits to threads
+  V2 already has are not merged, V2 stays authoritative.
+- Records copied ids in t3code_legacy_v1_resync, so a thread deleted in V2
+  is not resurrected on the next start.
+- A V1 project whose workspace root (Windows paths case- and
+  slash-insensitive) matches a live V2 project is not duplicated; its
+  threads move to the V2 project.
+- Copies only columns both schemas have; one transaction; failures are
+  logged and never block startup.
+
+Tests: legacyV1Resync.test.ts (V1 -> V2 -> V1 edits -> V2, through the
+real migrations and importer). Also checked by hand against a copy of the
+affected install: all 4 threads and their 125 user/assistant messages
+imported, 14_Orchestrator merged into the existing V2 project.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/persistence/initializeV2Database.ts   |  17 ++
+ .../src/persistence/legacyV1Resync.test.ts    | 178 +++++++++++
+ apps/server/src/persistence/legacyV1Resync.ts | 284 ++++++++++++++++++
+ 3 files changed, 479 insertions(+)
+ create mode 100644 apps/server/src/persistence/legacyV1Resync.test.ts
+ create mode 100644 apps/server/src/persistence/legacyV1Resync.ts
+
+diff --git a/apps/server/src/persistence/initializeV2Database.ts b/apps/server/src/persistence/initializeV2Database.ts
+index 7f63bb9c4c..14167bfe94 100644
+--- a/apps/server/src/persistence/initializeV2Database.ts
++++ b/apps/server/src/persistence/initializeV2Database.ts
+@@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
+ import * as Path from "effect/Path";
+ import * as Schema from "effect/Schema";
+ 
++import { resyncLegacyV1Threads } from "./legacyV1Resync.ts";
++
+ export class V2DatabaseImportError extends Schema.TaggedError<V2DatabaseImportError>()(
+   "V2DatabaseImportError",
+   { sourcePath: Schema.String, destinationPath: Schema.String, cause: Schema.Defect() },
+@@ -22,6 +24,7 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
+   const path = yield* Path.Path;
+   const directory = path.dirname(destinationPath);
+   const sourcePath = path.join(directory, "state.sqlite");
++  const hadV2Database = yield* fs.exists(destinationPath).pipe(Effect.orElseSucceed(() => false));
+   yield* Effect.gen(function* () {
+     if (yield* fs.exists(destinationPath)) return;
+     if (!(yield* fs.exists(sourcePath))) return;
+@@ -50,4 +53,18 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
+     Effect.scoped,
+     Effect.mapError((cause) => new V2DatabaseImportError({ sourcePath, destinationPath, cause })),
+   );
++  // Threads created in a V1 build after the snapshot (a downgrade and
++  // upgrade) would otherwise stay invisible. Best effort: never blocks startup.
++  if (hadV2Database && (yield* fs.exists(sourcePath).pipe(Effect.orElseSucceed(() => false)))) {
++    yield* Effect.try(() => resyncLegacyV1Threads(sourcePath, destinationPath)).pipe(
++      Effect.tap((summary) =>
++        summary.copiedThreadCount === 0 && summary.copiedProjectCount === 0
++          ? Effect.void
++          : Effect.logInfo("Copied V1 threads created after the V2 snapshot", summary),
++      ),
++      Effect.catch((cause) =>
++        Effect.logWarning("Could not copy newer V1 threads into the V2 database", { cause }),
++      ),
++    );
++  }
+ });
+diff --git a/apps/server/src/persistence/legacyV1Resync.test.ts b/apps/server/src/persistence/legacyV1Resync.test.ts
+new file mode 100644
+index 0000000000..92b871aa66
+--- /dev/null
++++ b/apps/server/src/persistence/legacyV1Resync.test.ts
+@@ -0,0 +1,178 @@
++// @effect-diagnostics nodeBuiltinImport:off
++import * as NodeFS from "node:fs";
++import * as NodeOS from "node:os";
++import * as NodePath from "node:path";
++import * as NodeSqlite from "node:sqlite";
++
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, it } from "@effect/vitest";
++import { ThreadId } from "@t3tools/contracts";
++import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as SqlClient from "effect/sql/SqlClient";
++
++import * as ServerConfig from "../config.ts";
++import * as SqlitePersistence from "./Sqlite.ts";
++import { runMigrations } from "./Migrations.ts";
++import { RESYNC_TABLE, resyncLegacyV1Threads, workspaceRootKey } from "./legacyV1Resync.ts";
++import * as EventStore from "../orchestration-v2/EventStore.ts";
++import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
++import * as EventSink from "../orchestration-v2/EventSink.ts";
++import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
++
++const T0 = "2026-01-01T00:00:00.000Z";
++
++function v1Exec(path: string, sql: string) {
++  const database = new NodeSqlite.DatabaseSync(path);
++  try {
++    database.exec(sql);
++  } finally {
++    database.close();
++  }
++}
++
++it("compares Windows workspace roots case- and slash-insensitively", () => {
++  assert.equal(workspaceRootKey("C:\\Users\\Me\\Proj\\"), workspaceRootKey("c:/users/me/proj"));
++  assert.notEqual(workspaceRootKey("/home/Me/proj"), workspaceRootKey("/home/me/proj"));
++});
++
++it.effect("imports V1 threads created after the V2 snapshot, once, without touching V1", () => {
++  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v1-resync-"));
++  const sourcePath = NodePath.join(directory, "state.sqlite");
++  const destinationPath = NodePath.join(directory, "statev2.sqlite");
++  const early = ThreadId.make("early-thread");
++  const later = ThreadId.make("later-thread");
++  const sameRoot = ThreadId.make("same-root-thread");
++  const deleted = ThreadId.make("deleted-thread");
++
++  const seed = Effect.gen(function* () {
++    const sql = yield* SqlClient.SqlClient;
++    yield* runMigrations({ toMigrationInclusive: 52 });
++    yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
++      VALUES ('project', 'Project', '/tmp/project', '[]', ${T0}, ${T0})`;
++    yield* sql`INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
++      VALUES (${early}, 'project', 'Early', '{"instanceId":"codex","model":"gpt-5.4"}', 'full-access', 'default', ${T0}, ${T0})`;
++  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: sourcePath })));
++
++  return Effect.gen(function* () {
++    yield* seed;
++    const config = yield* ServerConfig.ServerConfig;
++    const layerDatabase = SqlitePersistence.layerConfig.pipe(
++      Layer.provide(ServerConfig.layer({ ...config, dbPath: destinationPath })),
++    );
++    const layerStores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
++      Layer.provideMerge(layerDatabase),
++    );
++    const layerSink = EventSink.layer.pipe(Layer.provide(layerStores));
++    const layerImporter = LegacyV1ThreadImporter.layer.pipe(
++      Layer.provideMerge(Layer.mergeAll(layerStores, layerSink)),
++    );
++
++    // First V2 start: snapshot plus import, then a project added in V2.
++    yield* Effect.gen(function* () {
++      const sql = yield* SqlClient.SqlClient;
++      const legacy = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
++      assert.equal((yield* legacy.reconcileShells).importedThreadCount, 1);
++      yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
++        VALUES ('v2-project', 'Shared', 'C:\\Work\\Shared', '[]', ${T0}, ${T0})`;
++    }).pipe(Effect.provide(layerImporter));
++
++    // Back in V1 for a while: new projects and threads, an edit, a deletion.
++    v1Exec(
++      sourcePath,
++      `INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
++           VALUES ('later-project', 'Later', '/tmp/later', '[]', '2026-02-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z'),
++                  ('v1-shared', 'Shared (V1)', 'c:/work/shared/', '[]', '2026-02-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z');
++         INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
++           VALUES ('${later}', 'later-project', 'Later', '{"instanceId":"codex","model":"gpt-5.4"}', 'full-access', 'plan', '2026-02-02T00:00:00.000Z', '2026-02-02T00:00:00.000Z'),
++                  ('${sameRoot}', 'v1-shared', 'Same root', NULL, 'full-access', 'default', '2026-02-03T00:00:00.000Z', '2026-02-03T00:00:00.000Z');
++         INSERT INTO projection_threads (thread_id, project_id, title, runtime_mode, interaction_mode, created_at, updated_at, deleted_at)
++           VALUES ('${deleted}', 'later-project', 'Deleted', 'full-access', 'default', '2026-02-04T00:00:00.000Z', '2026-02-04T00:00:00.000Z', '2026-02-05T00:00:00.000Z');
++         INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at)
++           VALUES ('m1', '${later}', 'user', 'First', 0, '2026-02-02T00:00:01.000Z', '2026-02-02T00:00:01.000Z'),
++                  ('m2', '${later}', 'assistant', 'Second', 0, '2026-02-02T00:00:02.000Z', '2026-02-02T00:00:02.000Z'),
++                  ('m3', '${later}', 'user', 'Third', 0, '2026-02-02T00:00:03.000Z', '2026-02-02T00:00:03.000Z');
++         UPDATE projection_threads SET title = 'Edited in V1' WHERE thread_id = '${early}';`,
++    );
++    const v1Bytes = NodeFS.readFileSync(sourcePath);
++
++    // Second V2 start: initializeV2Database copies the newer V1 rows.
++    yield* Effect.gen(function* () {
++      const sql = yield* SqlClient.SqlClient;
++      const legacy = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
++      const projections = yield* ProjectionStore.ProjectionStoreV2;
++      assert.equal((yield* legacy.reconcileShells).importedThreadCount, 2);
++
++      const shell = yield* projections.getThreadProjection(later);
++      assert.equal(shell.thread.title, "Later");
++      yield* legacy.ensureTranscript(later);
++      const transcript = yield* projections.getThreadProjection(later);
++      assert.deepEqual(
++        transcript.messages.map((message) => message.text),
++        ["First", "Second", "Third"],
++      );
++
++      const rows = yield* sql<{ thread_id: string; project_id: string; title: string }>`
++          SELECT thread_id, project_id, title FROM projection_threads ORDER BY thread_id`;
++      assert.deepEqual(
++        rows.map((row) => [row.thread_id, row.project_id, row.title]),
++        [
++          [early, "project", "Early"],
++          [later, "later-project", "Later"],
++          [sameRoot, "v2-project", "Same root"],
++        ],
++      );
++      const projects = yield* sql<{ project_id: string }>`
++          SELECT project_id FROM projection_projects ORDER BY project_id`;
++      assert.deepEqual(
++        projects.map((row) => row.project_id),
++        ["later-project", "project", "v2-project"],
++      );
++
++      // The user deletes a copied thread's row in V2; it must not come back.
++      yield* sql`DELETE FROM projection_threads WHERE thread_id = ${sameRoot}`;
++    }).pipe(Effect.provide(layerImporter));
++
++    assert.deepEqual(NodeFS.readFileSync(sourcePath), v1Bytes);
++    assert.deepEqual(resyncLegacyV1Threads(sourcePath, destinationPath), {
++      copiedProjectCount: 0,
++      copiedThreadCount: 0,
++      copiedMessageCount: 0,
++    });
++    const v2 = new NodeSqlite.DatabaseSync(destinationPath, { readOnly: true });
++    try {
++      assert.equal(
++        v2.prepare(`SELECT count(*) AS count FROM ${RESYNC_TABLE} WHERE kind = 'thread'`).get()
++          ?.count,
++        2,
++      );
++      assert.equal(
++        v2
++          .prepare(`SELECT count(*) AS count FROM projection_threads WHERE thread_id = ?`)
++          .get(sameRoot)?.count,
++        0,
++      );
++    } finally {
++      v2.close();
++    }
++  }).pipe(
++    Effect.provide(
++      ServerConfig.layerTest(directory, directory).pipe(Layer.provideMerge(NodeServices.layer)),
++    ),
++    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
++  );
++});
++
++it("does nothing when V2 has not been migrated or V1 has no threads table", () => {
++  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v1-resync-empty-"));
++  try {
++    const sourcePath = NodePath.join(directory, "state.sqlite");
++    const destinationPath = NodePath.join(directory, "statev2.sqlite");
++    v1Exec(sourcePath, "CREATE TABLE unrelated (x TEXT)");
++    v1Exec(destinationPath, "CREATE TABLE projection_threads (thread_id TEXT PRIMARY KEY)");
++    assert.equal(resyncLegacyV1Threads(sourcePath, destinationPath).copiedThreadCount, 0);
++  } finally {
++    NodeFS.rmSync(directory, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/server/src/persistence/legacyV1Resync.ts b/apps/server/src/persistence/legacyV1Resync.ts
+new file mode 100644
+index 0000000000..537c5a4d2f
+--- /dev/null
++++ b/apps/server/src/persistence/legacyV1Resync.ts
+@@ -0,0 +1,284 @@
++// @effect-diagnostics nodeBuiltinImport:off -- Runs on raw node:sqlite before the SQL client layer exists, like initializeV2Database.
++// @effect-diagnostics globalDate:off -- The copy timestamp is plain bookkeeping outside any Effect fiber.
++import * as NodeSqlite from "node:sqlite";
++
++/**
++ * Brings V1 threads created after the V2 snapshot into the V2 database.
++ *
++ * `initializeV2Database` copies `state.sqlite` once, when `statev2.sqlite`
++ * does not exist yet. A user who ran a V2 build, went back to a V1 build
++ * (0.0.x) and kept working, then upgraded again, has threads that exist only
++ * in `state.sqlite`: V2 never looks at that file again, so they vanish from
++ * the sidebar although nothing was lost.
++ *
++ * This copies those rows (projects, threads, messages, pull-request links)
++ * into the V2 database's legacy projection tables, the same tables the
++ * snapshot fills. `LegacyV1ThreadImporter` then imports them at startup
++ * exactly like snapshot threads (shells first, transcripts lazily).
++ *
++ * Rules:
++ * - Only threads whose id the V2 database has never seen (not in its legacy
++ *   tables, not imported, not a V2 thread) and that are not deleted in V1.
++ *   Edits to threads V2 already has are not merged; V2 stays authoritative.
++ * - Each copied id is recorded in `t3code_legacy_v1_resync`, so a thread the
++ *   user deletes in V2 is never resurrected from V1 on a later start.
++ * - A V1 project whose workspace root already belongs to a live V2 project
++ *   is not duplicated; its threads move to the V2 project.
++ * - `state.sqlite` is opened read-only (as the snapshot does) and never
++ *   modified.
++ * - One transaction: either everything new is copied or nothing is.
++ */
++
++export interface LegacyV1ResyncSummary {
++  readonly copiedProjectCount: number;
++  readonly copiedThreadCount: number;
++  readonly copiedMessageCount: number;
++}
++
++const EMPTY: LegacyV1ResyncSummary = {
++  copiedProjectCount: 0,
++  copiedThreadCount: 0,
++  copiedMessageCount: 0,
++};
++
++export const RESYNC_TABLE = "t3code_legacy_v1_resync";
++
++type Row = Record<string, NodeSqlite.SQLOutputValue>;
++
++function hasTable(database: NodeSqlite.DatabaseSync, table: string): boolean {
++  return (
++    database
++      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?`)
++      .get(table) !== undefined
++  );
++}
++
++function columns(database: NodeSqlite.DatabaseSync, table: string): string[] {
++  return database
++    .prepare(`SELECT name FROM pragma_table_info(?)`)
++    .all(table)
++    .map((row) => String(row.name));
++}
++
++function idSet(database: NodeSqlite.DatabaseSync, sql: string, ...params: string[]): Set<string> {
++  return new Set(
++    database
++      .prepare(sql)
++      .all(...params)
++      .map((row) => String(row.id)),
++  );
++}
++
++function quoteIdentifier(name: string): string {
++  return `"${name.replace(/"/g, '""')}"`;
++}
++
++/** Windows paths compare case-insensitively and with either slash. */
++export function workspaceRootKey(root: string): string {
++  const unified = root.replace(/\\/g, "/").replace(/\/+$/, "");
++  return /^[A-Za-z]:\//.test(unified) || unified.startsWith("//") ? unified.toLowerCase() : unified;
++}
++
++/** Columns both schemas have, so a V1 file from another migration level still copies. */
++function sharedColumns(
++  source: NodeSqlite.DatabaseSync,
++  destination: NodeSqlite.DatabaseSync,
++  table: string,
++): string[] | null {
++  if (!hasTable(source, table) || !hasTable(destination, table)) return null;
++  const destinationColumns = new Set(columns(destination, table));
++  return columns(source, table).filter((name) => destinationColumns.has(name));
++}
++
++function insertRows(
++  database: NodeSqlite.DatabaseSync,
++  table: string,
++  rows: ReadonlyArray<Row>,
++  shared: ReadonlyArray<string> | null,
++): number {
++  if (rows.length === 0 || !shared || shared.length === 0) return 0;
++  const statement = database.prepare(
++    `INSERT OR IGNORE INTO ${quoteIdentifier(table)} (${shared.map(quoteIdentifier).join(", ")})
++     VALUES (${shared.map(() => "?").join(", ")})`,
++  );
++  let inserted = 0;
++  for (const row of rows) {
++    inserted += Number(statement.run(...shared.map((name) => row[name] ?? null)).changes);
++  }
++  return inserted;
++}
++
++export function resyncLegacyV1Threads(
++  sourcePath: string,
++  destinationPath: string,
++  now: () => string = () => new Date().toISOString(),
++): LegacyV1ResyncSummary {
++  const source = new NodeSqlite.DatabaseSync(sourcePath, { readOnly: true });
++  try {
++    if (!hasTable(source, "projection_threads") || !hasTable(source, "projection_projects")) {
++      return EMPTY;
++    }
++    const destination = new NodeSqlite.DatabaseSync(destinationPath);
++    try {
++      destination.exec("PRAGMA busy_timeout = 5000");
++      // A V2 database that has not been migrated yet has nothing to import into.
++      if (
++        !hasTable(destination, "projection_threads") ||
++        !hasTable(destination, "projection_projects")
++      ) {
++        return EMPTY;
++      }
++      destination.exec(`CREATE TABLE IF NOT EXISTS ${RESYNC_TABLE} (
++        kind TEXT NOT NULL,
++        id TEXT NOT NULL,
++        copied_at TEXT NOT NULL,
++        PRIMARY KEY (kind, id)
++      )`);
++
++      const seenThreads = idSet(destination, `SELECT thread_id AS id FROM projection_threads`);
++      for (const id of idSet(destination, `SELECT id FROM ${RESYNC_TABLE} WHERE kind = 'thread'`)) {
++        seenThreads.add(id);
++      }
++      for (const table of [
++        "orchestration_v2_legacy_imports",
++        "orchestration_v2_projection_threads",
++      ]) {
++        if (!hasTable(destination, table)) continue;
++        for (const id of idSet(destination, `SELECT thread_id AS id FROM ${table}`)) {
++          seenThreads.add(id);
++        }
++      }
++      const seenProjects = idSet(destination, `SELECT project_id AS id FROM projection_projects`);
++      for (const id of idSet(
++        destination,
++        `SELECT id FROM ${RESYNC_TABLE} WHERE kind = 'project'`,
++      )) {
++        seenProjects.add(id);
++      }
++
++      const threads = (
++        source
++          .prepare(
++            `SELECT * FROM projection_threads WHERE deleted_at IS NULL ORDER BY created_at, thread_id`,
++          )
++          .all() as Row[]
++      ).filter((thread) => !seenThreads.has(String(thread.thread_id)));
++      const newProjects = (
++        source
++          .prepare(
++            `SELECT * FROM projection_projects WHERE deleted_at IS NULL ORDER BY created_at, project_id`,
++          )
++          .all() as Row[]
++      ).filter((project) => !seenProjects.has(String(project.project_id)));
++      if (threads.length === 0 && newProjects.length === 0) return EMPTY;
++
++      const liveRoots = new Map<string, string>();
++      for (const row of destination
++        .prepare(
++          `SELECT project_id, workspace_root FROM projection_projects WHERE deleted_at IS NULL ORDER BY created_at`,
++        )
++        .all()) {
++        const key = workspaceRootKey(String(row.workspace_root));
++        if (!liveRoots.has(key)) liveRoots.set(key, String(row.project_id));
++      }
++      const knownProjectIds = idSet(
++        destination,
++        `SELECT project_id AS id FROM projection_projects`,
++      );
++
++      const projectRemap = new Map<string, string>();
++      const projectsToCopy: Row[] = [];
++      for (const project of newProjects) {
++        const projectId = String(project.project_id);
++        const key = workspaceRootKey(String(project.workspace_root));
++        const existing = liveRoots.get(key);
++        if (existing !== undefined) {
++          projectRemap.set(projectId, existing);
++        } else {
++          projectsToCopy.push(project);
++          liveRoots.set(key, projectId);
++          knownProjectIds.add(projectId);
++        }
++      }
++
++      // A thread needs a project the V2 sidebar can show; one whose V1
++      // project is deleted or missing is left alone (and not marked).
++      const threadsToCopy = threads
++        .map((thread): Row & { project_id: string } => ({
++          ...thread,
++          project_id: projectRemap.get(String(thread.project_id)) ?? String(thread.project_id),
++        }))
++        .filter((thread) => knownProjectIds.has(thread.project_id));
++      if (threadsToCopy.length === 0 && projectsToCopy.length === 0) return EMPTY;
++
++      const projectColumns = sharedColumns(source, destination, "projection_projects");
++      const threadColumns = sharedColumns(source, destination, "projection_threads");
++      const messageColumns = sharedColumns(source, destination, "projection_thread_messages");
++      const pullRequestColumns = sharedColumns(
++        source,
++        destination,
++        "projection_thread_pull_requests",
++      );
++      const selectMessages = messageColumns
++        ? source.prepare(
++            `SELECT * FROM projection_thread_messages WHERE thread_id = ? ORDER BY created_at, message_id`,
++          )
++        : null;
++      const selectPullRequests = pullRequestColumns
++        ? source.prepare(`SELECT * FROM projection_thread_pull_requests WHERE thread_id = ?`)
++        : null;
++
++      const copiedAt = now();
++      const mark = destination.prepare(
++        `INSERT OR IGNORE INTO ${RESYNC_TABLE} (kind, id, copied_at) VALUES (?, ?, ?)`,
++      );
++      destination.exec("BEGIN IMMEDIATE");
++      try {
++        const copiedProjectCount = insertRows(
++          destination,
++          "projection_projects",
++          projectsToCopy,
++          projectColumns,
++        );
++        for (const project of newProjects)
++          mark.run("project", String(project.project_id), copiedAt);
++        const copiedThreadCount = insertRows(
++          destination,
++          "projection_threads",
++          threadsToCopy,
++          threadColumns,
++        );
++        let copiedMessageCount = 0;
++        for (const thread of threadsToCopy) {
++          const threadId = String(thread.thread_id);
++          if (selectMessages) {
++            copiedMessageCount += insertRows(
++              destination,
++              "projection_thread_messages",
++              selectMessages.all(threadId) as Row[],
++              messageColumns,
++            );
++          }
++          if (selectPullRequests) {
++            insertRows(
++              destination,
++              "projection_thread_pull_requests",
++              selectPullRequests.all(threadId) as Row[],
++              pullRequestColumns,
++            );
++          }
++          mark.run("thread", threadId, copiedAt);
++        }
++        destination.exec("COMMIT");
++        return { copiedProjectCount, copiedThreadCount, copiedMessageCount };
++      } catch (cause) {
++        destination.exec("ROLLBACK");
++        throw cause;
++      }
++    } finally {
++      destination.close();
++    }
++  } finally {
++    source.close();
++  }
++}
+-- 
+2.43.0
+

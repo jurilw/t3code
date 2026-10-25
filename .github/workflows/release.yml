@@ -1,16 +1,25 @@
 name: Release patched T3 Code
 
 # Follows upstream stable releases of pingdotgg/t3code. For each new one it
-# applies patches/*.patch, runs the patch's tests, builds the Windows x64
-# installer with this fork as its update feed, and publishes a release here
-# with the same version number. Installed copies then update from this repo
-# through T3 Code's normal "update available" flow.
+# applies patches/*.patch, runs the release gate (ci/gate.sh: every patch
+# wired in and tested), builds the Windows x64 installer with this fork as its
+# update feed, checks the built bundles contain every patch
+# (ci/verify-build.sh), and creates a release here with the same version.
 #
-# The server is untouched by the patches, so the app keeps using the official
-# server archive for SSH and WSL environments.
+# Publish mode (safety): releases are created as DRAFTS unless told
+# otherwise. Drafts are invisible to the app's updater, so nothing
+# auto-installs anywhere until Juri approves. To approve:
+#   - one release:   gh release edit <tag> -R jurilw/t3code --draft=false --latest
+#   - from now on:   gh variable set PUBLISH_MODE -R jurilw/t3code --body release
+# Manual runs can pick draft | prerelease | release for that run.
 #
-# If a patch no longer applies, the run fails (GitHub emails the repo owner)
-# and nothing is published; installed copies stay on the last good version.
+# Patches 0001 (burn meter) and 0002 (dictation) change the desktop and web
+# client only. 0003 (legacy V1 thread import) changes the server bundled as
+# the desktop's local backend. SSH and WSL environments keep the official
+# server (the WSL archive below is downloaded from upstream unchanged).
+#
+# If a patch no longer applies, the run fails and nothing is published;
+# selfrepair/selfrepair.sh on pgx then tries to refresh the patches.
 
 on:
   schedule:
@@ -21,9 +30,14 @@ on:
         description: Upstream tag to build (defaults to the latest stable release)
         required: false
       force:
-        description: Rebuild even if this fork already has a release for the tag
+        description: Rebuild even if this fork already has a release (or draft) for the tag
         type: boolean
         default: false
+      publish_mode:
+        description: "draft (default, invisible to updaters) | prerelease | release (auto-updates installed copies)"
+        type: choice
+        options: [default, draft, prerelease, release]
+        default: default
 
 permissions:
   contents: write
@@ -44,16 +58,25 @@ jobs:
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
       build: ${{ steps.pick.outputs.build }}
+      mode: ${{ steps.pick.outputs.mode }}
     steps:
       - id: pick
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
           FORCE: ${{ inputs.force }}
+          INPUT_MODE: ${{ inputs.publish_mode }}
+          REPO_MODE: ${{ vars.PUBLISH_MODE }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}"
+          mode="${INPUT_MODE:-default}"
+          if [ "$mode" = "default" ]; then mode="${REPO_MODE:-draft}"; fi
+          case "$mode" in draft|prerelease|release) ;; *) echo "Unknown publish mode '$mode'"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Publish mode: $mode"
+          # gh release view also finds drafts (the token belongs to the repo).
           if [ "$FORCE" != "true" ] && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Already released $tag."
             echo "build=false" >> "$GITHUB_OUTPUT"
@@ -105,13 +128,9 @@ jobs:
         working-directory: src
         run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts... --filter=@t3tools/web...
 
-      - name: Test the patch
-        working-directory: src
+      - name: Release gate (burn meter, dictation, legacy thread import)
         shell: bash
-        run: |
-          set -euo pipefail
-          vp test run apps/web/src/components/chat/BurnRateMeter.logic.test.ts
-          vp run --filter @t3tools/web typecheck
+        run: bash ci/ci/gate.sh src
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -160,6 +179,10 @@ jobs:
             --output-dir "$GITHUB_WORKSPACE/release"
           ls -la "$GITHUB_WORKSPACE/release"
 
+      - name: Build gate (every patch is in the bundles)
+        shell: bash
+        run: bash ci/ci/verify-build.sh src
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ env.TAG }}
@@ -174,6 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.check.outputs.tag }}
+      MODE: ${{ needs.check.outputs.mode }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
@@ -184,16 +208,23 @@ jobs:
       - name: Publish release
         run: |
           set -euo pipefail
-          notes="Official T3 Code $TAG plus the patches in this repo's patches/ folder (burn-rate meter).
+          notes="Official T3 Code $TAG plus the patches in this repo's patches/ folder:
+          burn-rate meter, local dictation (desktop, whisper.cpp), import of V1 threads created after the V2 upgrade.
           Unsigned Windows x64 build: SmartScreen shows a warning on first install.
           Upstream release notes: https://github.com/$UPSTREAM/releases/tag/$TAG"
+          case "$MODE" in
+            draft) flags=(--draft) ;;
+            prerelease) flags=(--prerelease --latest=false) ;;
+            release) flags=(--latest) ;;
+          esac
           # Tag this repo's own commit: tagging the upstream commit fails with
           # HTTP 403 whenever that release touched .github/workflows, because
           # GITHUB_TOKEN cannot have the workflows permission.
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-            --title "T3 Code $TAG + burn-rate meter" \
+            --title "T3 Code $TAG + patches" \
             --notes "$notes" \
             --target "$GITHUB_SHA" \
-            --latest \
+            "${flags[@]}" \
             release/*
+          echo "Created $MODE release $TAG"

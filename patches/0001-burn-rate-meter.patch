@@ -1,7 +1,7 @@
-From 9cb7badc26f11031b8ebe28c8b32f24080013a21 Mon Sep 17 00:00:00 2001
+From dc08c012d58feb046dd7e4e22bb1b44ceda8bc9a Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Tue, 20 Oct 2026 18:05:49 +0100
-Subject: [PATCH] feat(composer): usage burn-rate meter
+Subject: [PATCH 1/3] feat(composer): usage burn-rate meter
 
 Shows how fast the selected provider's subscription quota is burning as a
 multiple of the even pace: 1x spends each window's quota at exactly the
@@ -16,8 +16,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../chat/BurnRateMeter.logic.test.ts          | 208 +++++++++++++++
  .../components/chat/BurnRateMeter.logic.ts    | 248 ++++++++++++++++++
  .../web/src/components/chat/BurnRateMeter.tsx | 228 ++++++++++++++++
- apps/web/src/components/chat/ChatComposer.tsx |   7 +
- 4 files changed, 691 insertions(+)
+ apps/web/src/components/chat/ChatComposer.tsx |   1 +
+ .../chat/ComposerFooterControls.tsx           |   7 +
+ 5 files changed, 692 insertions(+)
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.test.ts
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.logic.ts
  create mode 100644 apps/web/src/components/chat/BurnRateMeter.tsx
@@ -725,27 +726,46 @@ index 0000000000..43b3dba72b
 +  );
 +}
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 822e79da8d..7f180311f7 100644
+index b74e691ddd..af88378b68 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -311,6 +311,7 @@ import {
-   renderProviderTraitsMenuContent,
-   renderProviderTraitsPicker,
- } from "./composerProviderState";
+@@ -3906,6 +3906,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+                       settings.contextWindowMeterEnabled ? activeContextWindow : null
+                     }
+                     reserveContextWindowMeter={reserveContextWindowMeter}
++                    usageLimitsProvider={isComposerResting ? null : selectedProviderStatus}
+                     activeThreadModelDisplayName={activeThreadModelDisplayName}
+                     pendingAction={pendingPrimaryAction}
+                     isRunning={phase === "running"}
+diff --git a/apps/web/src/components/chat/ComposerFooterControls.tsx b/apps/web/src/components/chat/ComposerFooterControls.tsx
+index 4e4ebac157..3d5a6102c2 100644
+--- a/apps/web/src/components/chat/ComposerFooterControls.tsx
++++ b/apps/web/src/components/chat/ComposerFooterControls.tsx
+@@ -1,5 +1,6 @@
+ import type {
+   ModelSelection,
++  ServerProvider,
+   ProviderInstanceId,
+   ProviderInteractionMode,
+   RuntimeMode,
+@@ -19,6 +20,7 @@ import {
+ } from "./ComposerControl";
+ import { useComposerMenuProps } from "./composerEventScope";
+ import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 +import { BurnRateMeter } from "./BurnRateMeter";
  import { ContextWindowMeter, ContextWindowMeterPlaceholder } from "./ContextWindowMeter";
- import {
-   providerSupportsManualCompaction,
-@@ -1384,6 +1385,8 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
+ import { resolveModelPickerSelectedModel } from "./ModelPickerContent";
+ import { ProviderModelPicker } from "./ProviderModelPicker";
+@@ -152,6 +154,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
    canOperateThread: boolean;
    activeContextWindow: ContextWindowSnapshot | null;
    reserveContextWindowMeter: boolean;
 +  /** Subscription quota to pace against; providers without windows show nothing. */
-+  usageLimitsProvider: ServerProvider | null;
++  usageLimitsProvider?: ServerProvider | null;
    activeThreadModelDisplayName: string | null;
    isPreparingWorktree: boolean;
    pendingAction: {
-@@ -1421,6 +1424,9 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
+@@ -190,6 +194,9 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
  }) {
    return (
      <>
@@ -755,14 +775,6 @@ index 822e79da8d..7f180311f7 100644
        {props.activeContextWindow ? (
          <ContextWindowMeter
            usage={props.activeContextWindow}
-@@ -7601,6 +7607,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
-                       settings.contextWindowMeterEnabled ? activeContextWindow : null
-                     }
-                     reserveContextWindowMeter={reserveContextWindowMeter}
-+                    usageLimitsProvider={isComposerResting ? null : selectedProviderStatus}
-                     activeThreadModelDisplayName={activeThreadModelDisplayName}
-                     pendingAction={pendingPrimaryAction}
-                     isRunning={phase === "running"}
 -- 
 2.43.0
 

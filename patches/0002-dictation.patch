@@ -1,0 +1,1836 @@
+From dbd51269c962b2f2907a1827c48b9bef847041d4 Mon Sep 17 00:00:00 2001
+From: jurilw <washington.juri@gmail.com>
+Date: Sun, 25 Oct 2026 13:35:42 +0000
+Subject: [PATCH 2/3] feat(composer): local dictation through the desktop app
+
+A mic button in the composer records a prompt and inserts the transcript
+at the caret. Transcription is done by a whisper.cpp whisper-server.
+
+Why the desktop and not the T3 server: the server a patched desktop talks
+to is often the official build (SSH environments on another host; the
+iPhone app needs a current official server there). A server-side RPC would
+mean patching and pinning that server. Instead the Electron main process
+sends each clip itself, so dictation works against any server version:
+
+- T3CODE_TRANSCRIBE_SSH_HOST=<ssh alias>: runs `ssh <host> curl ...` and
+  pipes the clip to a whisper-server on that host's loopback
+  (T3CODE_TRANSCRIBE_REMOTE_URL, default http://127.0.0.1:8178/inference).
+  BatchMode, the user's own ssh config and keys; no tunnel or port to keep.
+- otherwise HTTP to T3CODE_TRANSCRIBE_URL (default the same loopback URL
+  on the desktop machine, e.g. a local server or a manual ssh -L).
+- T3CODE_TRANSCRIBE_URL=off disables it.
+
+The button is rendered only while the backend answers a probe (re-checked
+every 30 s and on window focus, cached 15 s in the main process), and never
+outside the desktop app, so web and mobile clients see nothing.
+
+The recording lives in a module-level session store (one microphone, one
+session) so layout changes cannot stop it: scrolling the timeline used to
+rest the composer, unmount the button and drop the clip. An active session
+also counts as expanded chrome, so the composer stays open while
+dictating. Transcripts go to the composer that started the session; if it
+is gone they are held, copied to the clipboard and inserted on return.
+
+Tests: dictationSession.test.ts, dictationAvailability.test.ts (web),
+whisperTranscription.test.ts (desktop).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dictation/whisperTranscription.test.ts    | 182 +++++++++
+ .../src/dictation/whisperTranscription.ts     | 343 ++++++++++++++++
+ apps/desktop/src/ipc/DesktopIpcHandlers.ts    |   3 +
+ apps/desktop/src/ipc/channels.ts              |   2 +
+ apps/desktop/src/ipc/methods/dictation.ts     |  65 +++
+ apps/desktop/src/preload.ts                   |   4 +
+ apps/web/src/components/chat/ChatComposer.tsx |  19 +
+ .../src/components/chat/DictationButton.tsx   | 130 ++++++
+ .../chat/dictationAvailability.test.ts        | 126 ++++++
+ .../components/chat/dictationAvailability.ts  | 126 ++++++
+ .../components/chat/dictationSession.test.ts  | 237 +++++++++++
+ .../src/components/chat/dictationSession.ts   | 374 ++++++++++++++++++
+ packages/contracts/src/ipc.ts                 |  22 ++
+ 13 files changed, 1633 insertions(+)
+ create mode 100644 apps/desktop/src/dictation/whisperTranscription.test.ts
+ create mode 100644 apps/desktop/src/dictation/whisperTranscription.ts
+ create mode 100644 apps/desktop/src/ipc/methods/dictation.ts
+ create mode 100644 apps/web/src/components/chat/DictationButton.tsx
+ create mode 100644 apps/web/src/components/chat/dictationAvailability.test.ts
+ create mode 100644 apps/web/src/components/chat/dictationAvailability.ts
+ create mode 100644 apps/web/src/components/chat/dictationSession.test.ts
+ create mode 100644 apps/web/src/components/chat/dictationSession.ts
+
+diff --git a/apps/desktop/src/dictation/whisperTranscription.test.ts b/apps/desktop/src/dictation/whisperTranscription.test.ts
+new file mode 100644
+index 0000000000..54dee1e04c
+--- /dev/null
++++ b/apps/desktop/src/dictation/whisperTranscription.test.ts
+@@ -0,0 +1,182 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  DEFAULT_TRANSCRIBE_URL,
++  type ProcessResult,
++  type TranscriptionDeps,
++  cleanTranscript,
++  parseWhisperResponse,
++  probeTranscription,
++  resolveTranscriptionBackend,
++  shellQuote,
++  sshTranscribeArgs,
++  transcribeAudio,
++} from "./whisperTranscription.ts";
++
++const CLIP = Buffer.from("fake opus bytes").toString("base64");
++
++function depsWith(overrides: Partial<TranscriptionDeps>): TranscriptionDeps {
++  return {
++    fetch: () => Promise.reject(new Error("no network in tests")),
++    runProcess: () => Promise.resolve({ exitCode: 255, stdout: "", stderr: "unreachable" }),
++    sshCommand: "ssh",
++    ...overrides,
++  };
++}
++
++describe("resolveTranscriptionBackend", () => {
++  it("defaults to a whisper-server on this machine's loopback", () => {
++    expect(resolveTranscriptionBackend({})).toEqual({ kind: "http", url: DEFAULT_TRANSCRIBE_URL });
++  });
++
++  it("can be turned off", () => {
++    expect(resolveTranscriptionBackend({ T3CODE_TRANSCRIBE_URL: "off" })).toBeNull();
++    expect(
++      resolveTranscriptionBackend({
++        T3CODE_TRANSCRIBE_URL: "off",
++        T3CODE_TRANSCRIBE_SSH_HOST: "pgx",
++      }),
++    ).toBeNull();
++  });
++
++  it("uses ssh when a host is configured", () => {
++    expect(resolveTranscriptionBackend({ T3CODE_TRANSCRIBE_SSH_HOST: "pgx" })).toEqual({
++      kind: "ssh",
++      host: "pgx",
++      remoteUrl: DEFAULT_TRANSCRIBE_URL,
++    });
++  });
++
++  it("rejects hosts that could be read as ssh options or shell", () => {
++    expect(
++      resolveTranscriptionBackend({ T3CODE_TRANSCRIBE_SSH_HOST: "-oProxyCommand=x" }),
++    ).toBeNull();
++    expect(resolveTranscriptionBackend({ T3CODE_TRANSCRIBE_SSH_HOST: "pgx; rm -rf ~" })).toBeNull();
++  });
++
++  it("rejects non-http urls", () => {
++    expect(resolveTranscriptionBackend({ T3CODE_TRANSCRIBE_URL: "file:///etc/passwd" })).toBeNull();
++  });
++});
++
++describe("whisper responses", () => {
++  it("cleans non-speech markers", () => {
++    expect(cleanTranscript(" [BLANK_AUDIO] hello  (music) world\n")).toBe("hello world");
++  });
++
++  it("reads text, errors and HTTP failures", () => {
++    expect(parseWhisperResponse(200, '{"text":" Hi there.\\n"}')).toEqual({
++      ok: true,
++      text: "Hi there.",
++    });
++    expect(parseWhisperResponse(null, '{"error":"bad audio"}')).toEqual({
++      ok: false,
++      message: "Transcription failed: bad audio",
++    });
++    expect(parseWhisperResponse(500, "boom").ok).toBe(false);
++    expect(parseWhisperResponse(null, "").ok).toBe(false);
++  });
++});
++
++describe("ssh transport", () => {
++  const backend = { kind: "ssh", host: "pgx", remoteUrl: DEFAULT_TRANSCRIBE_URL } as const;
++
++  it("quotes the remote command for a POSIX shell", () => {
++    expect(shellQuote("it's")).toBe(`'it'\\''s'`);
++    const args = sshTranscribeArgs(backend, { mimeType: "audio/webm;codecs=opus", language: "en" });
++    expect(args.slice(0, 6)).toEqual(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T", "--"]);
++    expect(args[6]).toBe("pgx");
++    expect(args).toHaveLength(8);
++    expect(args[7]).toContain(`'file=@-;filename=dictation.webm;type=audio/webm'`);
++    expect(args[7]).toContain(`'language=en'`);
++    expect(args[7]).toContain(`'${DEFAULT_TRANSCRIBE_URL}'`);
++  });
++
++  it("drops a language hint that is not a plain ISO code", () => {
++    const args = sshTranscribeArgs(backend, { mimeType: "audio/webm", language: "en'; id" });
++    expect(args[7]).not.toContain("language");
++  });
++
++  it("pipes the clip to curl on the host and returns the cleaned text", async () => {
++    const calls: Array<{ args: ReadonlyArray<string>; stdin: Uint8Array | null }> = [];
++    const deps = depsWith({
++      runProcess: (_command, args, stdin): Promise<ProcessResult> => {
++        calls.push({ args, stdin });
++        return Promise.resolve({
++          exitCode: 0,
++          stdout: '{"text":" Ask not. [BLANK_AUDIO]"}',
++          stderr: "",
++        });
++      },
++    });
++    const outcome = await transcribeAudio(
++      backend,
++      { audioBase64: CLIP, mimeType: "audio/webm" },
++      deps,
++    );
++    expect(outcome).toEqual({ ok: true, text: "Ask not." });
++    expect(Buffer.from(calls[0]!.stdin!).toString()).toBe("fake opus bytes");
++  });
++
++  it("reports ssh failures instead of throwing", async () => {
++    const outcome = await transcribeAudio(
++      backend,
++      { audioBase64: CLIP, mimeType: "audio/webm" },
++      depsWith({}),
++    );
++    expect(outcome.ok).toBe(false);
++    if (!outcome.ok) expect(outcome.message).toContain("ssh pgx");
++  });
++
++  it("is available only when curl on the host gets an HTTP answer", async () => {
++    const up = depsWith({
++      runProcess: () => Promise.resolve({ exitCode: 0, stdout: "200", stderr: "" }),
++    });
++    const down = depsWith({
++      runProcess: () => Promise.resolve({ exitCode: 7, stdout: "000", stderr: "" }),
++    });
++    expect((await probeTranscription(backend, up)).available).toBe(true);
++    expect((await probeTranscription(backend, down)).available).toBe(false);
++    expect((await probeTranscription(backend, depsWith({}))).available).toBe(false);
++  });
++});
++
++describe("http transport", () => {
++  const backend = { kind: "http", url: DEFAULT_TRANSCRIBE_URL } as const;
++
++  it("hides the button when nothing listens", async () => {
++    expect((await probeTranscription(backend, depsWith({}))).available).toBe(false);
++    expect((await probeTranscription(null, depsWith({}))).available).toBe(false);
++  });
++
++  it("posts the clip as multipart and reads whisper's JSON", async () => {
++    let seen: { url: string; body: FormData } | null = null;
++    const deps = depsWith({
++      fetch: ((url: string, init: RequestInit) => {
++        seen = { url, body: init.body as FormData };
++        return Promise.resolve(new Response('{"text":"hello"}', { status: 200 }));
++      }) as unknown as typeof fetch,
++    });
++    const outcome = await transcribeAudio(
++      backend,
++      { audioBase64: CLIP, mimeType: "audio/ogg;codecs=opus" },
++      deps,
++    );
++    expect(outcome).toEqual({ ok: true, text: "hello" });
++    expect(seen!.url).toBe(DEFAULT_TRANSCRIBE_URL);
++    const file = seen!.body.get("file") as File;
++    expect(file.name).toBe("dictation.ogg");
++    expect(seen!.body.get("response_format")).toBe("json");
++  });
++
++  it("refuses empty and oversized clips without a request", async () => {
++    const deps = depsWith({});
++    expect(
++      (await transcribeAudio(backend, { audioBase64: "", mimeType: "audio/webm" }, deps)).ok,
++    ).toBe(false);
++    const huge = Buffer.alloc(7 * 1024 * 1024).toString("base64");
++    expect(
++      (await transcribeAudio(backend, { audioBase64: huge, mimeType: "audio/webm" }, deps)).ok,
++    ).toBe(false);
++  });
++});
+diff --git a/apps/desktop/src/dictation/whisperTranscription.ts b/apps/desktop/src/dictation/whisperTranscription.ts
+new file mode 100644
+index 0000000000..44871591d6
+--- /dev/null
++++ b/apps/desktop/src/dictation/whisperTranscription.ts
+@@ -0,0 +1,343 @@
++// @effect-diagnostics globalTimers:off -- Request deadlines run outside Effect fibers.
++// @effect-diagnostics nodeBuiltinImport:off -- This desktop-only helper owns an ssh child process.
++// @effect-diagnostics globalFetch:off -- The main process posts clips with Node fetch; no Effect runtime here.
++import * as NodeChildProcess from "node:child_process";
++
++/**
++ * Dictation for the desktop app, done entirely by the desktop (main process).
++ *
++ * Why not the T3 server: the server the app talks to is often the official
++ * build on a remote host (SSH environments, the iPhone app's server), and a
++ * patched desktop must keep working against it. So the desktop sends each clip
++ * to a whisper.cpp `whisper-server` itself, either
++ *
++ *   - over HTTP (`T3CODE_TRANSCRIBE_URL`, default http://127.0.0.1:8178/inference,
++ *     e.g. a local whisper-server or a manual `ssh -L 8178:127.0.0.1:8178 host`), or
++ *   - through `ssh <T3CODE_TRANSCRIBE_SSH_HOST> curl ...` to a whisper-server
++ *     listening on that host's loopback (`T3CODE_TRANSCRIBE_REMOTE_URL`, same
++ *     default). No tunnel or port to manage; uses the user's ssh config and keys
++ *     non-interactively (BatchMode).
++ *
++ * The mic button is shown only while the configured backend answers a probe.
++ * `T3CODE_TRANSCRIBE_URL=off` turns dictation off.
++ */
++
++export const DEFAULT_TRANSCRIBE_URL = "http://127.0.0.1:8178/inference";
++export const TRANSCRIBE_TIMEOUT_MS = 120_000;
++export const PROBE_TIMEOUT_MS = 8_000;
++/** Same cap as a few minutes of opus; anything bigger is a stuck recorder. */
++export const MAX_AUDIO_BYTES = 6 * 1024 * 1024;
++
++export type TranscriptionBackend =
++  | { readonly kind: "http"; readonly url: string }
++  | { readonly kind: "ssh"; readonly host: string; readonly remoteUrl: string };
++
++export interface TranscriptionStatus {
++  readonly available: boolean;
++  /** Where clips go, for the tooltip; null when dictation is off. */
++  readonly backend: string | null;
++  readonly detail: string | null;
++}
++
++export interface TranscribeAudioRequest {
++  readonly audioBase64: string;
++  readonly mimeType: string;
++  readonly language?: string | undefined;
++}
++
++export type TranscribeAudioOutcome =
++  | { readonly ok: true; readonly text: string }
++  | { readonly ok: false; readonly message: string };
++
++const SSH_HOST_PATTERN = /^[A-Za-z0-9_.@:-]+$/;
++const LANGUAGE_PATTERN = /^[a-z]{2,3}$/;
++
++export function resolveTranscriptionBackend(
++  env: Readonly<Record<string, string | undefined>>,
++): TranscriptionBackend | null {
++  const url = env.T3CODE_TRANSCRIBE_URL?.trim();
++  if (url === "off") return null;
++  const host = env.T3CODE_TRANSCRIBE_SSH_HOST?.trim();
++  if (host) {
++    // The host goes on the ssh command line; refuse anything that could be an option.
++    if (!SSH_HOST_PATTERN.test(host) || host.startsWith("-")) return null;
++    const remoteUrl = env.T3CODE_TRANSCRIBE_REMOTE_URL?.trim() || DEFAULT_TRANSCRIBE_URL;
++    if (!isHttpUrl(remoteUrl)) return null;
++    return { kind: "ssh", host, remoteUrl };
++  }
++  const httpUrl = url || DEFAULT_TRANSCRIBE_URL;
++  return isHttpUrl(httpUrl) ? { kind: "http", url: httpUrl } : null;
++}
++
++function isHttpUrl(value: string): boolean {
++  try {
++    const parsed = new URL(value);
++    return parsed.protocol === "http:" || parsed.protocol === "https:";
++  } catch {
++    return false;
++  }
++}
++
++export function describeBackend(backend: TranscriptionBackend): string {
++  return backend.kind === "http" ? backend.url : `${backend.remoteUrl} via ssh ${backend.host}`;
++}
++
++/** whisper-server's root page answers 200; any HTTP answer means it is up. */
++export function probeUrlFor(inferenceUrl: string): string {
++  return new URL("/", inferenceUrl).toString();
++}
++
++export function extensionFor(mimeType: string): string {
++  const base = baseMimeType(mimeType);
++  if (base.endsWith("/ogg")) return "ogg";
++  if (base.endsWith("/mp4") || base.endsWith("/m4a")) return "m4a";
++  if (base.endsWith("/wav") || base.endsWith("/x-wav")) return "wav";
++  if (base.endsWith("/mpeg")) return "mp3";
++  return "webm";
++}
++
++/** `audio/webm;codecs=opus` -> `audio/webm`; whisper-server --convert sniffs the rest. */
++export function baseMimeType(mimeType: string): string {
++  const base = mimeType.split(";")[0]?.trim().toLowerCase() ?? "";
++  return /^[a-z]+\/[a-z0-9.+-]+$/.test(base) ? base : "application/octet-stream";
++}
++
++/** whisper.cpp marks non-speech as `[BLANK_AUDIO]`, `(music)` and the like. */
++export function cleanTranscript(text: string): string {
++  return text
++    .replace(/\[[A-Z_ ]+\]/g, " ")
++    .replace(/\((?:music|silence|inaudible|applause|laughter)\)/gi, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++}
++
++/** whisper-server answers `{ text }` on success and `{ error }` on a bad upload. */
++export function parseWhisperResponse(status: number | null, body: string): TranscribeAudioOutcome {
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(body);
++  } catch {
++    parsed = undefined;
++  }
++  const record =
++    typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
++  if (status !== null && (status < 200 || status >= 300)) {
++    return { ok: false, message: `Transcription failed (${status}): ${body.slice(0, 200)}` };
++  }
++  if (typeof record.text === "string") return { ok: true, text: cleanTranscript(record.text) };
++  const error =
++    typeof record.error === "string" ? record.error : body.slice(0, 200) || "empty response";
++  return { ok: false, message: `Transcription failed: ${error}` };
++}
++
++/** POSIX single-quoting for the remote shell that ssh hands the command to. */
++export function shellQuote(value: string): string {
++  return `'${value.replace(/'/g, `'\\''`)}'`;
++}
++
++export function sshBaseArgs(host: string): string[] {
++  return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T", "--", host];
++}
++
++export function sshProbeArgs(backend: Extract<TranscriptionBackend, { kind: "ssh" }>): string[] {
++  const remote = [
++    "curl",
++    "-s",
++    "-o",
++    "/dev/null",
++    "-w",
++    "%{http_code}",
++    "--max-time",
++    "4",
++    probeUrlFor(backend.remoteUrl),
++  ];
++  return [...sshBaseArgs(backend.host), remote.map(shellQuote).join(" ")];
++}
++
++/** curl reads the clip from stdin (`@-`) and prints whisper's JSON. */
++export function sshTranscribeArgs(
++  backend: Extract<TranscriptionBackend, { kind: "ssh" }>,
++  request: Pick<TranscribeAudioRequest, "mimeType" | "language">,
++): string[] {
++  const remote = [
++    "curl",
++    "-sS",
++    "--max-time",
++    String(Math.round(TRANSCRIBE_TIMEOUT_MS / 1000)),
++    "-F",
++    `file=@-;filename=dictation.${extensionFor(request.mimeType)};type=${baseMimeType(request.mimeType)}`,
++    "-F",
++    "response_format=json",
++    "-F",
++    "temperature=0",
++    ...(request.language && LANGUAGE_PATTERN.test(request.language)
++      ? ["-F", `language=${request.language}`]
++      : []),
++    backend.remoteUrl,
++  ];
++  return [...sshBaseArgs(backend.host), remote.map(shellQuote).join(" ")];
++}
++
++export interface ProcessResult {
++  readonly exitCode: number | null;
++  readonly stdout: string;
++  readonly stderr: string;
++}
++
++export interface TranscriptionDeps {
++  readonly fetch: typeof globalThis.fetch;
++  readonly runProcess: (
++    command: string,
++    args: ReadonlyArray<string>,
++    stdin: Uint8Array | null,
++    timeoutMs: number,
++  ) => Promise<ProcessResult>;
++  readonly sshCommand: string;
++}
++
++export function runProcess(
++  command: string,
++  args: ReadonlyArray<string>,
++  stdin: Uint8Array | null,
++  timeoutMs: number,
++): Promise<ProcessResult> {
++  return new Promise((resolve) => {
++    let child: NodeChildProcess.ChildProcess;
++    try {
++      child = NodeChildProcess.spawn(command, [...args], {
++        stdio: ["pipe", "pipe", "pipe"],
++        windowsHide: true,
++      });
++    } catch (cause) {
++      resolve({ exitCode: null, stdout: "", stderr: String(cause) });
++      return;
++    }
++    const stdout: Buffer[] = [];
++    const stderr: Buffer[] = [];
++    let settled = false;
++    const finish = (exitCode: number | null, extra = "") => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(timer);
++      resolve({
++        exitCode,
++        stdout: Buffer.concat(stdout).toString("utf8"),
++        stderr: Buffer.concat(stderr).toString("utf8") + extra,
++      });
++    };
++    const timer = setTimeout(() => {
++      child.kill();
++      finish(null, "timed out");
++    }, timeoutMs);
++    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
++    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
++    child.on("error", (error) => finish(null, error.message));
++    child.on("close", (code) => finish(code));
++    child.stdin?.on("error", () => {});
++    if (stdin) child.stdin?.end(Buffer.from(stdin));
++    else child.stdin?.end();
++  });
++}
++
++export const defaultDeps: TranscriptionDeps = {
++  fetch: (input, init) => globalThis.fetch(input, init),
++  runProcess,
++  sshCommand: "ssh",
++};
++
++export async function probeTranscription(
++  backend: TranscriptionBackend | null,
++  deps: TranscriptionDeps = defaultDeps,
++): Promise<TranscriptionStatus> {
++  if (backend === null) {
++    return { available: false, backend: null, detail: "Dictation is turned off." };
++  }
++  const described = describeBackend(backend);
++  if (backend.kind === "http") {
++    try {
++      await deps.fetch(probeUrlFor(backend.url), {
++        method: "GET",
++        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
++      });
++      return { available: true, backend: described, detail: null };
++    } catch {
++      return {
++        available: false,
++        backend: described,
++        detail: `No whisper-server at ${backend.url}.`,
++      };
++    }
++  }
++  const result = await deps.runProcess(
++    deps.sshCommand,
++    sshProbeArgs(backend),
++    null,
++    PROBE_TIMEOUT_MS,
++  );
++  const code = Number.parseInt(result.stdout.trim(), 10);
++  if (result.exitCode === 0 && Number.isFinite(code) && code > 0) {
++    return { available: true, backend: described, detail: null };
++  }
++  return {
++    available: false,
++    backend: described,
++    detail: `No whisper-server reachable as ${described}.`,
++  };
++}
++
++export async function transcribeAudio(
++  backend: TranscriptionBackend | null,
++  request: TranscribeAudioRequest,
++  deps: TranscriptionDeps = defaultDeps,
++): Promise<TranscribeAudioOutcome> {
++  if (backend === null) return { ok: false, message: "Dictation is turned off." };
++  const audio = Buffer.from(request.audioBase64, "base64");
++  if (audio.byteLength === 0) return { ok: false, message: "The recording was empty." };
++  if (audio.byteLength > MAX_AUDIO_BYTES) {
++    return { ok: false, message: "The recording is too long to transcribe." };
++  }
++  if (backend.kind === "http") {
++    const form = new FormData();
++    form.append(
++      "file",
++      new Blob([audio], { type: baseMimeType(request.mimeType) }),
++      `dictation.${extensionFor(request.mimeType)}`,
++    );
++    form.append("response_format", "json");
++    form.append("temperature", "0");
++    if (request.language && LANGUAGE_PATTERN.test(request.language)) {
++      form.append("language", request.language);
++    }
++    let response: Response;
++    try {
++      response = await deps.fetch(backend.url, {
++        method: "POST",
++        body: form,
++        signal: AbortSignal.timeout(TRANSCRIBE_TIMEOUT_MS),
++      });
++    } catch {
++      return { ok: false, message: `No speech-to-text server answered at ${backend.url}.` };
++    }
++    let body = "";
++    try {
++      body = await response.text();
++    } catch {
++      return { ok: false, message: "Transcription was cut off." };
++    }
++    return parseWhisperResponse(response.status, body);
++  }
++  const result = await deps.runProcess(
++    deps.sshCommand,
++    sshTranscribeArgs(backend, request),
++    audio,
++    TRANSCRIBE_TIMEOUT_MS + 10_000,
++  );
++  if (result.exitCode !== 0) {
++    const reason = (result.stderr || result.stdout).trim().slice(0, 200) || "no output";
++    return {
++      ok: false,
++      message: `Transcription via ssh ${backend.host} failed (exit ${result.exitCode ?? "none"}): ${reason}`,
++    };
++  }
++  return parseWhisperResponse(null, result.stdout);
++}
+diff --git a/apps/desktop/src/ipc/DesktopIpcHandlers.ts b/apps/desktop/src/ipc/DesktopIpcHandlers.ts
+index 2d67aa56e6..d748f99ab5 100644
+--- a/apps/desktop/src/ipc/DesktopIpcHandlers.ts
++++ b/apps/desktop/src/ipc/DesktopIpcHandlers.ts
+@@ -71,6 +71,7 @@ import {
+   setSnapShotShortcutSuppressed,
+ } from "./methods/snapShot.ts";
+ import * as PreviewIpc from "./methods/preview.ts";
++import { getDictationStatus, transcribeDictation } from "./methods/dictation.ts";
+ import * as AppActivationIpc from "./methods/appActivation.ts";
+ import * as WebLinksIpc from "./methods/webLinks.ts";
+ import {
+@@ -155,6 +156,8 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
+   yield* ipc.handle(pasteAsText);
+   yield* ipc.handle(revealWindow);
+   yield* ipc.handle(probeRemoteEditors);
++  yield* ipc.handle(getDictationStatus);
++  yield* ipc.handle(transcribeDictation);
+   yield* ipc.handle(getUpdateState);
+   yield* ipc.handle(setUpdateChannel);
+   yield* ipc.handle(downloadUpdate);
+diff --git a/apps/desktop/src/ipc/channels.ts b/apps/desktop/src/ipc/channels.ts
+index 9b11a2283a..b45449f223 100644
+--- a/apps/desktop/src/ipc/channels.ts
++++ b/apps/desktop/src/ipc/channels.ts
+@@ -7,6 +7,8 @@ export const CONTEXT_MENU_CHANNEL = "desktop:context-menu";
+ export const OPEN_EXTERNAL_CHANNEL = "desktop:open-external";
+ export const OPEN_SYSTEM_SETTINGS_CHANNEL = "desktop:open-system-settings";
+ export const PROBE_REMOTE_EDITORS_CHANNEL = "desktop:probe-remote-editors";
++export const GET_DICTATION_STATUS_CHANNEL = "desktop:get-dictation-status";
++export const TRANSCRIBE_DICTATION_CHANNEL = "desktop:transcribe-dictation";
+ export const MENU_ACTION_CHANNEL = "desktop:menu-action";
+ export const PASTE_AS_TEXT_CHANNEL = "desktop:paste-as-text";
+ export const REVEAL_WINDOW_CHANNEL = "desktop:reveal-window";
+diff --git a/apps/desktop/src/ipc/methods/dictation.ts b/apps/desktop/src/ipc/methods/dictation.ts
+new file mode 100644
+index 0000000000..8c9bd57005
+--- /dev/null
++++ b/apps/desktop/src/ipc/methods/dictation.ts
+@@ -0,0 +1,65 @@
++// @effect-diagnostics globalDate:off -- A wall-clock probe cache shared across IPC calls.
++import * as HostProcess from "@t3tools/shared/HostProcess";
++import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
++
++import * as Transcription from "../../dictation/whisperTranscription.ts";
++import * as DesktopIpc from "../DesktopIpc.ts";
++import * as IpcChannels from "../channels.ts";
++
++const TranscriptionStatus = Schema.Struct({
++  available: Schema.Boolean,
++  backend: Schema.NullOr(Schema.String),
++  detail: Schema.NullOr(Schema.String),
++});
++
++const TranscribeAudioRequest = Schema.Struct({
++  audioBase64: Schema.String.check(Schema.isMaxLength(9 * 1024 * 1024)),
++  mimeType: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
++  language: Schema.optional(Schema.String.check(Schema.isMaxLength(8))),
++});
++
++const TranscribeAudioOutcome = Schema.Union([
++  Schema.Struct({ ok: Schema.Literal(true), text: Schema.String }),
++  Schema.Struct({ ok: Schema.Literal(false), message: Schema.String }),
++]);
++
++/** A probe spawns ssh in ssh mode; several composers asking at once share one. */
++const PROBE_CACHE_MS = 15_000;
++let cachedProbe: {
++  readonly at: number;
++  readonly status: Promise<Transcription.TranscriptionStatus>;
++} | null = null;
++
++function probe(env: NodeJS.ProcessEnv, force: boolean): Promise<Transcription.TranscriptionStatus> {
++  const now = Date.now();
++  if (!force && cachedProbe && now - cachedProbe.at < PROBE_CACHE_MS) return cachedProbe.status;
++  const status = Transcription.probeTranscription(Transcription.resolveTranscriptionBackend(env));
++  cachedProbe = { at: now, status };
++  return status;
++}
++
++export const getDictationStatus = DesktopIpc.makeIpcMethod({
++  channel: IpcChannels.GET_DICTATION_STATUS_CHANNEL,
++  payload: Schema.Boolean,
++  result: TranscriptionStatus,
++  handler: Effect.fn("desktop.ipc.dictation.status")(function* (force) {
++    const env = yield* HostProcess.Environment;
++    return yield* Effect.promise(() => probe(env, force));
++  }),
++});
++
++export const transcribeDictation = DesktopIpc.makeIpcMethod({
++  channel: IpcChannels.TRANSCRIBE_DICTATION_CHANNEL,
++  payload: TranscribeAudioRequest,
++  result: TranscribeAudioOutcome,
++  handler: Effect.fn("desktop.ipc.dictation.transcribe")(function* (request) {
++    const env = yield* HostProcess.Environment;
++    const outcome = yield* Effect.promise(() =>
++      Transcription.transcribeAudio(Transcription.resolveTranscriptionBackend(env), request),
++    );
++    // A failed upload says more about reachability than an old probe.
++    if (!outcome.ok) cachedProbe = null;
++    return outcome;
++  }),
++});
+diff --git a/apps/desktop/src/preload.ts b/apps/desktop/src/preload.ts
+index bffa02d9ca..8fe447de55 100644
+--- a/apps/desktop/src/preload.ts
++++ b/apps/desktop/src/preload.ts
+@@ -207,6 +207,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
+   openSystemSettings: (pane: string) =>
+     ipcRenderer.invoke(IpcChannels.OPEN_SYSTEM_SETTINGS_CHANNEL, pane),
+   probeRemoteEditors: () => ipcRenderer.invoke(IpcChannels.PROBE_REMOTE_EDITORS_CHANNEL, undefined),
++  getDictationStatus: (force?: boolean) =>
++    ipcRenderer.invoke(IpcChannels.GET_DICTATION_STATUS_CHANNEL, force === true),
++  transcribeDictation: (request: { audioBase64: string; mimeType: string; language?: string }) =>
++    ipcRenderer.invoke(IpcChannels.TRANSCRIBE_DICTATION_CHANNEL, request),
+   pasteAsText: () => ipcRenderer.invoke(IpcChannels.PASTE_AS_TEXT_CHANNEL, undefined),
+   onMenuAction: (listener) => {
+     const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index af88378b68..8146909bc8 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -205,6 +205,8 @@ import {
+ } from "./ComposerAttachmentStrip";
+ import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
+ import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
++import { DictationButton } from "./DictationButton";
++import { useIsDictating } from "./dictationSession";
+ import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
+ import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
+ import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
+@@ -2349,7 +2351,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       upload.environmentId === environmentId;
+     return nonPersistedComposerImageIdSet.has(image.id) && !failedInCurrentEnvironment;
+   });
++  // An active dictation holds the composer open so its stop button (and the
++  // recording timer) never disappear under a timeline scroll.
++  const isDictating = useIsDictating();
+   const composerHasExpandedChrome =
++    isDictating ||
+     showComposerTopDrawer ||
+     isTasksDrawerOpen ||
+     composerMenuOpen ||
+@@ -2686,6 +2692,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     );
+   };
+   const insertComposerTextStable = useStableCallback(insertComposerText);
++  // Returns false when the composer cannot take the text; the dictation
++  // session then keeps it pending (and on the clipboard) instead of dropping it.
++  const insertDictatedText = useStableCallback((text: string): boolean =>
++    insertComposerText(`${text} `, "cursor", { ensureLeadingBoundary: true }),
++  );
+ 
+   const insertAttachmentReferences = (
+     references: ReadonlyArray<ComposerContextReference>,
+@@ -3898,6 +3909,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+                   }
+                   className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
+                 >
++                  {isComposerResting && !isDictating ? null : (
++                    <DictationButton
++                      environmentId={environmentId}
++                      composerKey={composerDraftTargetKey}
++                      disabled={environmentUnavailable !== null}
++                      onTranscript={insertDictatedText}
++                    />
++                  )}
+                   {composerAttachButton}
+                   <ComposerFooterPrimaryActions
+                     compact={isComposerResting || isComposerPrimaryActionsCompact}
+diff --git a/apps/web/src/components/chat/DictationButton.tsx b/apps/web/src/components/chat/DictationButton.tsx
+new file mode 100644
+index 0000000000..5dfd63e08c
+--- /dev/null
++++ b/apps/web/src/components/chat/DictationButton.tsx
+@@ -0,0 +1,130 @@
++import type { EnvironmentId } from "@t3tools/contracts";
++import { LoaderCircleIcon, MicIcon, SquareIcon } from "lucide-react";
++import { useEffect, useRef, useState } from "react";
++
++import { Button } from "../ui/button";
++import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
++import {
++  type DictationTranscribe,
++  dictationSession,
++  dictationTargetKey,
++  useDictationSession,
++} from "./dictationSession";
++import { useDictationAvailability } from "./dictationAvailability";
++
++function formatElapsed(ms: number): string {
++  const seconds = Math.floor(ms / 1000);
++  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
++}
++
++const transcribeThroughDesktop: DictationTranscribe = async (input) => {
++  const transcribe = window.desktopBridge?.transcribeDictation;
++  if (!transcribe) return { ok: false, message: "Dictation needs the T3 Code desktop app." };
++  try {
++    return await transcribe(input);
++  } catch (cause) {
++    return { ok: false, message: cause instanceof Error ? cause.message : "Transcription failed." };
++  }
++};
++
++/**
++ * Click to record, click again to stop; the desktop app sends the clip to a
++ * whisper.cpp server (see apps/desktop/src/dictation) and the text lands at
++ * the caret of the composer that started it. Escape while recording throws
++ * the clip away. Renders nothing unless that server answers, so web, mobile
++ * and machines without a speech backend never see a dead button.
++ *
++ * The recording itself lives in `dictationSession`, so this button can
++ * unmount (thread switch, layout change) without losing it; a transcript for
++ * a composer that is not mounted is held and inserted when it returns.
++ */
++export function DictationButton(props: {
++  readonly environmentId: EnvironmentId;
++  /** Identifies this composer (draft or thread) within the environment. */
++  readonly composerKey: string;
++  readonly disabled?: boolean;
++  /** Inserts the text; returns false when the composer could not take it. */
++  readonly onTranscript: (text: string) => boolean;
++}) {
++  const { environmentId, composerKey, onTranscript } = props;
++  const targetKey = dictationTargetKey(environmentId, composerKey);
++  const session = useDictationSession();
++  const availability = useDictationAvailability();
++  const [elapsedMs, setElapsedMs] = useState(0);
++
++  const onTranscriptRef = useRef(onTranscript);
++  useEffect(() => {
++    onTranscriptRef.current = onTranscript;
++  }, [onTranscript]);
++
++  useEffect(
++    () => dictationSession.registerDeliverer(targetKey, (text) => onTranscriptRef.current(text)),
++    [targetKey],
++  );
++
++  const recording = session.phase === "recording";
++
++  // Display-only timer; the cap is enforced by the session.
++  useEffect(() => {
++    if (!recording) return;
++    const tick = () => setElapsedMs(Date.now() - session.startedAt);
++    tick();
++    const id = window.setInterval(tick, 250);
++    return () => window.clearInterval(id);
++  }, [recording, session.startedAt]);
++
++  const start = () => {
++    void dictationSession.start(targetKey, transcribeThroughDesktop);
++  };
++
++  // Never hide a session in progress, even if the backend just dropped.
++  if (!availability.available && session.phase === "idle") return null;
++
++  const busy = session.phase === "starting" || session.phase === "transcribing";
++  const label = recording
++    ? "Stop and transcribe (Esc to discard)"
++    : session.phase === "transcribing"
++      ? "Transcribing…"
++      : "Dictate a prompt";
++
++  return (
++    <Tooltip>
++      <TooltipTrigger
++        render={
++          <Button
++            type="button"
++            variant={recording ? "ghost-destructive" : "ghost"}
++            size={recording ? "sm" : "icon-sm"}
++            disabled={(props.disabled && !recording) || busy}
++            onPointerDown={(event) => event.preventDefault()}
++            onClick={() => (recording ? dictationSession.stop(false) : start())}
++            aria-label={label}
++            aria-pressed={recording}
++            data-testid="composer-dictation-button"
++          />
++        }
++      >
++        {recording ? (
++          <>
++            <span className="relative flex size-2">
++              <span className="absolute inline-flex size-full animate-ping rounded-full bg-destructive opacity-60 motion-reduce:animate-none" />
++              <span className="relative inline-flex size-2 rounded-full bg-destructive" />
++            </span>
++            <span className="text-xs tabular-nums">{formatElapsed(elapsedMs)}</span>
++            <SquareIcon className="size-3 fill-current" />
++          </>
++        ) : busy ? (
++          <LoaderCircleIcon className="animate-spin" />
++        ) : (
++          <MicIcon />
++        )}
++      </TooltipTrigger>
++      <TooltipPopup>
++        {label}
++        {availability.backend && session.phase === "idle" ? (
++          <span className="block text-muted-foreground text-xs">{availability.backend}</span>
++        ) : null}
++      </TooltipPopup>
++    </Tooltip>
++  );
++}
+diff --git a/apps/web/src/components/chat/dictationAvailability.test.ts b/apps/web/src/components/chat/dictationAvailability.test.ts
+new file mode 100644
+index 0000000000..e54fd2f2b2
+--- /dev/null
++++ b/apps/web/src/components/chat/dictationAvailability.test.ts
+@@ -0,0 +1,126 @@
++import type { DesktopDictationStatus } from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import { POLL_MS, createDictationAvailabilityStore } from "./dictationAvailability";
++
++function harness(probe?: (force: boolean) => Promise<DesktopDictationStatus>) {
++  const intervals = new Map<number, () => void>();
++  let nextId = 1;
++  const resumeHandlers = new Set<() => void>();
++  const calls: boolean[] = [];
++  const store = createDictationAvailabilityStore({
++    probe: probe
++      ? (force) => {
++          calls.push(force);
++          return probe(force);
++        }
++      : undefined,
++    setInterval(handler, ms) {
++      expect(ms).toBe(POLL_MS);
++      const id = nextId++;
++      intervals.set(id, handler);
++      return id;
++    },
++    clearInterval(handle) {
++      intervals.delete(handle as number);
++    },
++    onResume(handler) {
++      resumeHandlers.add(handler);
++      return () => resumeHandlers.delete(handler);
++    },
++  });
++  const tick = () => {
++    for (const handler of intervals.values()) handler();
++  };
++  const resume = () => {
++    for (const handler of resumeHandlers) handler();
++  };
++  return { store, intervals, resumeHandlers, calls, tick, resume };
++}
++
++/** Lets queued promise callbacks run; the store under test only awaits promises. */
++async function flush(): Promise<void> {
++  for (let index = 0; index < 10; index++) await Promise.resolve();
++}
++
++const up: DesktopDictationStatus = {
++  available: true,
++  backend: "whisper via ssh pgx",
++  detail: null,
++};
++const down: DesktopDictationStatus = {
++  available: false,
++  backend: "whisper via ssh pgx",
++  detail: "x",
++};
++
++describe("dictation availability", () => {
++  it("is never available outside the desktop app", async () => {
++    const { store, intervals } = harness();
++    const release = store.retain();
++    await flush();
++    expect(store.getSnapshot().available).toBe(false);
++    expect(intervals.size).toBe(0);
++    release();
++  });
++
++  it("shows the button only while the backend answers", async () => {
++    let status = down;
++    const { store, tick, resume, calls } = harness(() => Promise.resolve(status));
++    let notified = 0;
++    store.subscribe(() => notified++);
++    const release = store.retain();
++    await flush();
++    expect(store.getSnapshot()).toEqual({ available: false, backend: null });
++
++    status = up;
++    tick();
++    await flush();
++    expect(store.getSnapshot()).toEqual({ available: true, backend: "whisper via ssh pgx" });
++
++    status = down;
++    resume();
++    await flush();
++    expect(store.getSnapshot().available).toBe(false);
++    expect(calls).toEqual([false, false, true]);
++    expect(notified).toBe(2);
++    release();
++  });
++
++  it("treats a failing probe as unavailable", async () => {
++    const { store } = harness(() => Promise.reject(new Error("ipc gone")));
++    const release = store.retain();
++    await flush();
++    expect(store.getSnapshot().available).toBe(false);
++    release();
++  });
++
++  it("polls only while some button is mounted", async () => {
++    const { store, intervals, resumeHandlers, calls } = harness(() => Promise.resolve(up));
++    const releaseA = store.retain();
++    const releaseB = store.retain();
++    expect(calls).toHaveLength(1);
++    expect(intervals.size).toBe(1);
++    releaseA();
++    releaseA();
++    expect(intervals.size).toBe(1);
++    releaseB();
++    expect(intervals.size).toBe(0);
++    expect(resumeHandlers.size).toBe(0);
++    await flush();
++  });
++
++  it("ignores a slow answer that a newer check overtook", async () => {
++    const resolvers: Array<(status: DesktopDictationStatus) => void> = [];
++    const { store, resume } = harness(
++      () => new Promise<DesktopDictationStatus>((resolve) => resolvers.push(resolve)),
++    );
++    const release = store.retain();
++    resume();
++    resolvers[1]!(down);
++    resolvers[0]!(up);
++    await flush();
++    expect(store.getSnapshot().available).toBe(false);
++    release();
++  });
++});
+diff --git a/apps/web/src/components/chat/dictationAvailability.ts b/apps/web/src/components/chat/dictationAvailability.ts
+new file mode 100644
+index 0000000000..9fc2b78168
+--- /dev/null
++++ b/apps/web/src/components/chat/dictationAvailability.ts
+@@ -0,0 +1,126 @@
++import type { DesktopDictationStatus } from "@t3tools/contracts";
++import { useEffect, useSyncExternalStore } from "react";
++
++/**
++ * Whether the desktop app can reach a speech-to-text backend right now. One
++ * app-wide store: every composer shares the same answer, and the probe runs
++ * only while some mic button is mounted.
++ *
++ * Re-checked every POLL_MS while visible and immediately when the window
++ * regains focus (the usual moment a tunnel or VPN came back).
++ */
++
++export interface DictationAvailability {
++  readonly available: boolean;
++  readonly backend: string | null;
++}
++
++export interface DictationAvailabilityDeps {
++  /** Absent outside the desktop app: dictation is then never available. */
++  readonly probe: ((force: boolean) => Promise<DesktopDictationStatus>) | undefined;
++  setInterval(handler: () => void, ms: number): unknown;
++  clearInterval(handle: unknown): void;
++  /** Subscribes to "the user is back" signals; returns the unsubscribe. */
++  onResume(handler: () => void): () => void;
++}
++
++export const POLL_MS = 30_000;
++
++const UNAVAILABLE: DictationAvailability = { available: false, backend: null };
++
++export function createDictationAvailabilityStore(deps: DictationAvailabilityDeps) {
++  let snapshot: DictationAvailability = UNAVAILABLE;
++  const listeners = new Set<() => void>();
++  let users = 0;
++  let timer: unknown = null;
++  let removeResume: (() => void) | null = null;
++  let generation = 0;
++
++  function set(next: DictationAvailability) {
++    if (next.available === snapshot.available && next.backend === snapshot.backend) return;
++    snapshot = next;
++    for (const listener of listeners) listener();
++  }
++
++  async function check(force: boolean): Promise<void> {
++    const probe = deps.probe;
++    if (!probe) return;
++    const mine = ++generation;
++    try {
++      const status = await probe(force);
++      if (mine !== generation) return;
++      set({ available: status.available, backend: status.available ? status.backend : null });
++    } catch {
++      if (mine === generation) set(UNAVAILABLE);
++    }
++  }
++
++  /** A mounted mic button keeps the probe running; returns the release. */
++  function retain(): () => void {
++    users += 1;
++    if (users === 1 && deps.probe) {
++      void check(false);
++      timer = deps.setInterval(() => void check(false), POLL_MS);
++      removeResume = deps.onResume(() => void check(true));
++    }
++    let released = false;
++    return () => {
++      if (released) return;
++      released = true;
++      users -= 1;
++      if (users > 0) return;
++      if (timer !== null) deps.clearInterval(timer);
++      timer = null;
++      removeResume?.();
++      removeResume = null;
++    };
++  }
++
++  return {
++    getSnapshot: () => snapshot,
++    subscribe(listener: () => void): () => void {
++      listeners.add(listener);
++      return () => listeners.delete(listener);
++    },
++    retain,
++    check,
++  };
++}
++
++export type DictationAvailabilityStore = ReturnType<typeof createDictationAvailabilityStore>;
++
++function browserDeps(): DictationAvailabilityDeps {
++  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
++  const probe = bridge?.getDictationStatus;
++  return {
++    probe: probe ? (force) => probe(force) : undefined,
++    setInterval: (handler, ms) => window.setInterval(handler, ms),
++    clearInterval: (handle) => window.clearInterval(handle as number),
++    onResume(handler) {
++      const onVisible = () => {
++        if (document.visibilityState === "visible") handler();
++      };
++      window.addEventListener("focus", handler);
++      document.addEventListener("visibilitychange", onVisible);
++      return () => {
++        window.removeEventListener("focus", handler);
++        document.removeEventListener("visibilitychange", onVisible);
++      };
++    },
++  };
++}
++
++let appStore: DictationAvailabilityStore | null = null;
++function store(): DictationAvailabilityStore {
++  appStore ??= createDictationAvailabilityStore(browserDeps());
++  return appStore;
++}
++
++export function useDictationAvailability(): DictationAvailability {
++  useEffect(() => store().retain(), []);
++  return useSyncExternalStore(
++    (listener) => store().subscribe(listener),
++    () => store().getSnapshot(),
++    () => UNAVAILABLE,
++  );
++}
+diff --git a/apps/web/src/components/chat/dictationSession.test.ts b/apps/web/src/components/chat/dictationSession.test.ts
+new file mode 100644
+index 0000000000..4a4fd25673
+--- /dev/null
++++ b/apps/web/src/components/chat/dictationSession.test.ts
+@@ -0,0 +1,237 @@
++import { describe, expect, it, vi } from "vite-plus/test";
++
++import {
++  type DictationDeps,
++  type DictationNotice,
++  type DictationTranscribe,
++  MAX_RECORDING_MS,
++  createDictationSessionStore,
++} from "./dictationSession";
++
++class FakeTrack {
++  stopped = false;
++  private endedListeners: Array<() => void> = [];
++  stop() {
++    this.stopped = true;
++  }
++  addEventListener(_type: "ended", listener: () => void) {
++    this.endedListeners.push(listener);
++  }
++  end() {
++    for (const listener of this.endedListeners) listener();
++  }
++}
++
++class FakeRecorder {
++  state: "inactive" | "recording" | "paused" = "inactive";
++  ondataavailable: ((event: { data: Blob }) => void) | null = null;
++  onstop: (() => void) | null = null;
++  start() {
++    this.state = "recording";
++  }
++  stop() {
++    this.state = "inactive";
++    this.ondataavailable?.({ data: new Blob(["audio"]) });
++    this.onstop?.();
++  }
++}
++
++function setup() {
++  let now = 1_000;
++  const track = new FakeTrack();
++  const recorders: FakeRecorder[] = [];
++  const notices: DictationNotice[] = [];
++  const clipboard: string[] = [];
++  const timers = new Map<number, () => void>();
++  let nextTimer = 1;
++  let escapeHandler: (() => void) | null = null;
++
++  const deps: DictationDeps = {
++    pickMimeType: () => "audio/webm",
++    getUserMedia: async () => ({ getTracks: () => [track] }),
++    createRecorder: () => {
++      const recorder = new FakeRecorder();
++      recorders.push(recorder);
++      return recorder;
++    },
++    blobToBase64: async () => "QUJD",
++    copyToClipboard: async (text) => {
++      clipboard.push(text);
++      return true;
++    },
++    notify: (notice) => notices.push(notice),
++    onEscape: (handler) => {
++      escapeHandler = handler;
++      return () => {
++        if (escapeHandler === handler) escapeHandler = null;
++      };
++    },
++    now: () => now,
++    setTimeout: (handler) => {
++      const id = nextTimer++;
++      timers.set(id, handler);
++      return id;
++    },
++    clearTimeout: (handle) => {
++      timers.delete(handle as number);
++    },
++  };
++
++  const store = createDictationSessionStore(deps);
++  const transcribe = vi.fn<DictationTranscribe>(async () => ({ ok: true, text: "hello world" }));
++  return {
++    store,
++    track,
++    recorders,
++    notices,
++    clipboard,
++    timers,
++    transcribe,
++    advance: (ms: number) => {
++      now += ms;
++    },
++    pressEscape: () => escapeHandler?.(),
++    hasEscapeHandler: () => escapeHandler !== null,
++  };
++}
++
++/** Lets queued promise callbacks run; the store under test only awaits promises. */
++async function flush(): Promise<void> {
++  for (let index = 0; index < 10; index++) await Promise.resolve();
++}
++
++describe("dictationSession", () => {
++  it("keeps recording after the button that started it unmounts", async () => {
++    const t = setup();
++    const unregister = t.store.registerDeliverer("env::thread-a", () => true);
++    await t.store.start("env::thread-a", t.transcribe);
++    expect(t.store.getSnapshot()).toMatchObject({ phase: "recording", targetKey: "env::thread-a" });
++
++    // The composer rests / the thread switches: the button unmounts.
++    unregister();
++
++    expect(t.store.getSnapshot().phase).toBe("recording");
++    expect(t.recorders[0]?.state).toBe("recording");
++    expect(t.track.stopped).toBe(false);
++  });
++
++  it("delivers the transcript to the composer that started it", async () => {
++    const t = setup();
++    const intoA = vi.fn(() => true);
++    const intoB = vi.fn(() => true);
++    t.store.registerDeliverer("env::thread-a", intoA);
++    t.store.registerDeliverer("env::thread-b", intoB);
++    await t.store.start("env::thread-a", t.transcribe);
++    t.advance(2_000);
++    t.store.stop(false);
++    await flush();
++
++    expect(t.transcribe).toHaveBeenCalledWith({ audioBase64: "QUJD", mimeType: "audio/webm" });
++    expect(intoA).toHaveBeenCalledWith("hello world");
++    expect(intoB).not.toHaveBeenCalled();
++    expect(t.track.stopped).toBe(true);
++    expect(t.store.getSnapshot().phase).toBe("idle");
++    expect(t.clipboard).toEqual([]);
++  });
++
++  it("discards on Escape, releases the mic and stops listening for Escape", async () => {
++    const t = setup();
++    const deliver = vi.fn(() => true);
++    t.store.registerDeliverer("env::thread-a", deliver);
++    expect(t.hasEscapeHandler()).toBe(false);
++    await t.store.start("env::thread-a", t.transcribe);
++    expect(t.hasEscapeHandler()).toBe(true);
++    t.advance(2_000);
++    t.pressEscape();
++    await flush();
++
++    expect(t.transcribe).not.toHaveBeenCalled();
++    expect(deliver).not.toHaveBeenCalled();
++    expect(t.track.stopped).toBe(true);
++    expect(t.hasEscapeHandler()).toBe(false);
++    expect(t.timers.size).toBe(0);
++    expect(t.store.getSnapshot().phase).toBe("idle");
++  });
++
++  it("holds the transcript when its composer is gone and inserts it on return", async () => {
++    const t = setup();
++    const unregister = t.store.registerDeliverer("env::thread-a", () => true);
++    await t.store.start("env::thread-a", t.transcribe);
++    unregister();
++    t.advance(2_000);
++    t.store.stop(false);
++    await flush();
++
++    expect(t.store.getPending("env::thread-a")).toBe("hello world");
++    expect(t.clipboard).toEqual(["hello world"]);
++    expect(t.notices).toContainEqual(expect.objectContaining({ type: "info" }));
++
++    // A different composer mounting does not take it.
++    const intoB = vi.fn(() => true);
++    t.store.registerDeliverer("env::thread-b", intoB);
++    expect(intoB).not.toHaveBeenCalled();
++
++    const intoA = vi.fn(() => true);
++    t.store.registerDeliverer("env::thread-a", intoA);
++    expect(intoA).toHaveBeenCalledWith("hello world");
++    expect(t.store.getPending("env::thread-a")).toBeUndefined();
++  });
++
++  it("keeps the text pending when the mounted composer refuses it", async () => {
++    const t = setup();
++    t.store.registerDeliverer("env::thread-a", () => false);
++    await t.store.start("env::thread-a", t.transcribe);
++    t.advance(2_000);
++    t.store.stop(false);
++    await flush();
++
++    expect(t.store.getPending("env::thread-a")).toBe("hello world");
++    expect(t.clipboard).toEqual(["hello world"]);
++  });
++
++  it("transcribes at the length cap", async () => {
++    const t = setup();
++    const deliver = vi.fn(() => true);
++    t.store.registerDeliverer("env::thread-a", deliver);
++    await t.store.start("env::thread-a", t.transcribe);
++    expect(t.timers.size).toBe(1);
++    t.advance(MAX_RECORDING_MS);
++    for (const handler of t.timers.values()) handler();
++    await flush();
++
++    expect(deliver).toHaveBeenCalledWith("hello world");
++    expect(t.track.stopped).toBe(true);
++  });
++
++  it("transcribes what was captured when the microphone track ends", async () => {
++    const t = setup();
++    const deliver = vi.fn(() => true);
++    t.store.registerDeliverer("env::thread-a", deliver);
++    await t.store.start("env::thread-a", t.transcribe);
++    t.advance(2_000);
++    t.track.end();
++    await flush();
++
++    expect(deliver).toHaveBeenCalledWith("hello world");
++    expect(t.store.getSnapshot().phase).toBe("idle");
++  });
++
++  it("ignores a second start while a session is active", async () => {
++    const t = setup();
++    await t.store.start("env::thread-a", t.transcribe);
++    await t.store.start("env::thread-b", t.transcribe);
++    expect(t.recorders).toHaveLength(1);
++    expect(t.store.getSnapshot().targetKey).toBe("env::thread-a");
++  });
++
++  it("drops misclicks shorter than the minimum", async () => {
++    const t = setup();
++    await t.store.start("env::thread-a", t.transcribe);
++    t.advance(100);
++    t.store.stop(false);
++    await flush();
++    expect(t.transcribe).not.toHaveBeenCalled();
++    expect(t.track.stopped).toBe(true);
++    expect(t.store.getSnapshot().phase).toBe("idle");
++  });
++});
+diff --git a/apps/web/src/components/chat/dictationSession.ts b/apps/web/src/components/chat/dictationSession.ts
+new file mode 100644
+index 0000000000..3449f18f6e
+--- /dev/null
++++ b/apps/web/src/components/chat/dictationSession.ts
+@@ -0,0 +1,374 @@
++import { useSyncExternalStore } from "react";
++
++import { toastManager } from "../ui/toast";
++
++/**
++ * One microphone, one dictation session. The recorder lives here rather than
++ * in the button so that layout changes (the composer resting on a timeline
++ * scroll, a thread switch) can never stop or discard a recording. A session
++ * ends only on an explicit stop, Escape (discard), the length cap, or the
++ * microphone track ending.
++ */
++
++export type DictationPhase = "idle" | "starting" | "recording" | "transcribing";
++
++export interface DictationSnapshot {
++  readonly phase: DictationPhase;
++  /** The composer that started the session; its transcript goes back there. */
++  readonly targetKey: string | null;
++  /** Epoch ms when recording began; 0 unless recording. */
++  readonly startedAt: number;
++}
++
++export type DictationTranscribeOutcome =
++  | { readonly ok: true; readonly text: string }
++  | { readonly ok: false; readonly message: string };
++
++export type DictationTranscribe = (input: {
++  readonly audioBase64: string;
++  readonly mimeType: string;
++}) => Promise<DictationTranscribeOutcome>;
++
++/** Returns true when the text landed in the composer. */
++export type DictationDeliverer = (text: string) => boolean;
++
++interface RecorderLike {
++  readonly state: "inactive" | "recording" | "paused";
++  ondataavailable: ((event: { data: Blob }) => void) | null;
++  onstop: (() => void) | null;
++  start(timeslice?: number): void;
++  stop(): void;
++}
++
++interface TrackLike {
++  stop(): void;
++  addEventListener(type: "ended", listener: () => void): void;
++}
++
++interface StreamLike {
++  getTracks(): ReadonlyArray<TrackLike>;
++}
++
++export interface DictationNotice {
++  readonly type: "info" | "error";
++  readonly title: string;
++  readonly description?: string;
++}
++
++export interface DictationDeps {
++  pickMimeType(): string | undefined;
++  getUserMedia(): Promise<StreamLike>;
++  createRecorder(stream: StreamLike, mimeType: string): RecorderLike;
++  blobToBase64(blob: Blob): Promise<string>;
++  copyToClipboard(text: string): Promise<boolean>;
++  notify(notice: DictationNotice): void;
++  /** Subscribes to Escape key presses; returns the unsubscribe. */
++  onEscape(handler: () => void): () => void;
++  now(): number;
++  setTimeout(handler: () => void, ms: number): unknown;
++  clearTimeout(handle: unknown): void;
++}
++
++/** Long enough for a long prompt, short enough that one clip stays one frame. */
++export const MAX_RECORDING_MS = 5 * 60_000;
++/** Shorter than this is a misclick, not speech. */
++export const MIN_RECORDING_MS = 400;
++
++const IDLE: DictationSnapshot = { phase: "idle", targetKey: null, startedAt: 0 };
++
++export function dictationTargetKey(environmentId: string, composerKey: string): string {
++  return `${environmentId}::${composerKey}`;
++}
++
++export function createDictationSessionStore(deps: DictationDeps) {
++  let snapshot: DictationSnapshot = IDLE;
++  const listeners = new Set<() => void>();
++  const deliverers = new Map<string, DictationDeliverer[]>();
++  const pending = new Map<string, string>();
++
++  let recorder: RecorderLike | null = null;
++  let stream: StreamLike | null = null;
++  let discard = false;
++  let capTimer: unknown = null;
++  let removeEscape: (() => void) | null = null;
++
++  function set(next: DictationSnapshot) {
++    snapshot = next;
++    for (const listener of listeners) listener();
++  }
++
++  function releaseStream() {
++    if (capTimer !== null) {
++      deps.clearTimeout(capTimer);
++      capTimer = null;
++    }
++    removeEscape?.();
++    removeEscape = null;
++    const current = stream;
++    stream = null;
++    if (current) for (const track of current.getTracks()) track.stop();
++  }
++
++  function deliverNow(targetKey: string, text: string): boolean {
++    const stack = deliverers.get(targetKey);
++    const deliver = stack?.[stack.length - 1];
++    if (!deliver) return false;
++    try {
++      return deliver(text);
++    } catch {
++      return false;
++    }
++  }
++
++  function holdPending(targetKey: string, text: string) {
++    const existing = pending.get(targetKey);
++    pending.set(targetKey, existing ? `${existing} ${text}` : text);
++    void deps.copyToClipboard(text).then((copied) => {
++      deps.notify({
++        type: "info",
++        title: "Dictation saved",
++        description: copied
++          ? "Copied to the clipboard; it will also be inserted when you return to that composer."
++          : "It will be inserted when you return to that composer.",
++      });
++    });
++  }
++
++  function deliver(targetKey: string, text: string) {
++    if (deliverNow(targetKey, text)) return;
++    holdPending(targetKey, text);
++  }
++
++  async function finish(
++    targetKey: string,
++    blob: Blob,
++    mimeType: string,
++    durationMs: number,
++    transcribe: DictationTranscribe,
++  ) {
++    if (discard || durationMs < MIN_RECORDING_MS || blob.size === 0) {
++      set(IDLE);
++      return;
++    }
++    set({ phase: "transcribing", targetKey, startedAt: 0 });
++    try {
++      const audioBase64 = await deps.blobToBase64(blob);
++      const result = await transcribe({ audioBase64, mimeType });
++      if (!result.ok) {
++        deps.notify({ type: "error", title: "Dictation failed", description: result.message });
++      } else if (result.text) {
++        deliver(targetKey, result.text);
++      } else {
++        deps.notify({ type: "info", title: "No speech detected" });
++      }
++    } catch (cause) {
++      deps.notify({
++        type: "error",
++        title: "Dictation failed",
++        description: cause instanceof Error ? cause.message : String(cause),
++      });
++    } finally {
++      set(IDLE);
++    }
++  }
++
++  function stop(discardRecording: boolean) {
++    if (snapshot.phase !== "recording" || !recorder) return;
++    discard = discardRecording;
++    if (recorder.state !== "inactive") {
++      recorder.stop();
++    } else {
++      // Already stopped without an onstop; make sure the mic is released.
++      recorder = null;
++      releaseStream();
++      set(IDLE);
++    }
++  }
++
++  async function start(targetKey: string, transcribe: DictationTranscribe): Promise<void> {
++    if (snapshot.phase !== "idle") return;
++    const mimeType = deps.pickMimeType();
++    if (!mimeType) {
++      deps.notify({
++        type: "error",
++        title: "Dictation unavailable",
++        description: "This window cannot record audio.",
++      });
++      return;
++    }
++    set({ phase: "starting", targetKey, startedAt: 0 });
++    let opened: StreamLike;
++    try {
++      opened = await deps.getUserMedia();
++    } catch (cause) {
++      set(IDLE);
++      deps.notify({
++        type: "error",
++        title: "Microphone unavailable",
++        description:
++          typeof cause === "object" &&
++          cause !== null &&
++          (cause as { name?: unknown }).name === "NotAllowedError"
++            ? "Microphone access was denied."
++            : "No microphone could be opened.",
++      });
++      return;
++    }
++    stream = opened;
++    let next: RecorderLike;
++    try {
++      next = deps.createRecorder(opened, mimeType);
++    } catch (cause) {
++      releaseStream();
++      set(IDLE);
++      deps.notify({
++        type: "error",
++        title: "Dictation unavailable",
++        description: cause instanceof Error ? cause.message : "Could not start recording.",
++      });
++      return;
++    }
++    const chunks: Blob[] = [];
++    const startedAt = deps.now();
++    discard = false;
++    next.ondataavailable = (event) => {
++      if (event.data.size > 0) chunks.push(event.data);
++    };
++    next.onstop = () => {
++      if (recorder !== next) return;
++      recorder = null;
++      releaseStream();
++      void finish(
++        targetKey,
++        new Blob(chunks, { type: mimeType }),
++        mimeType,
++        deps.now() - startedAt,
++        transcribe,
++      );
++    };
++    // A microphone that goes away (unplugged, revoked) ends the clip; what was
++    // captured so far is still transcribed.
++    for (const track of opened.getTracks()) {
++      track.addEventListener("ended", () => stop(false));
++    }
++    recorder = next;
++    capTimer = deps.setTimeout(() => stop(false), MAX_RECORDING_MS);
++    removeEscape = deps.onEscape(() => stop(true));
++    next.start(1000);
++    set({ phase: "recording", targetKey, startedAt });
++  }
++
++  /**
++   * Registers the mounted composer for a target. Text held for that target is
++   * delivered right away. Returns the unregister function.
++   */
++  function registerDeliverer(targetKey: string, deliverer: DictationDeliverer): () => void {
++    const stack = deliverers.get(targetKey) ?? [];
++    stack.push(deliverer);
++    deliverers.set(targetKey, stack);
++    flushPending(targetKey);
++    return () => {
++      const current = deliverers.get(targetKey);
++      if (!current) return;
++      const index = current.lastIndexOf(deliverer);
++      if (index !== -1) current.splice(index, 1);
++      if (current.length === 0) deliverers.delete(targetKey);
++    };
++  }
++
++  function flushPending(targetKey: string): boolean {
++    const text = pending.get(targetKey);
++    if (text === undefined) return false;
++    if (!deliverNow(targetKey, text)) return false;
++    pending.delete(targetKey);
++    return true;
++  }
++
++  return {
++    getSnapshot: () => snapshot,
++    subscribe(listener: () => void): () => void {
++      listeners.add(listener);
++      return () => listeners.delete(listener);
++    },
++    start,
++    stop,
++    registerDeliverer,
++    flushPending,
++    getPending: (targetKey: string): string | undefined => pending.get(targetKey),
++  };
++}
++
++export type DictationSessionStore = ReturnType<typeof createDictationSessionStore>;
++
++const PREFERRED_MIME_TYPES = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm"];
++
++function browserDeps(): DictationDeps {
++  return {
++    pickMimeType() {
++      if (typeof MediaRecorder === "undefined") return undefined;
++      if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
++        return undefined;
++      }
++      return PREFERRED_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type));
++    },
++    getUserMedia: () =>
++      navigator.mediaDevices.getUserMedia({
++        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
++      }),
++    createRecorder: (stream, mimeType) =>
++      new MediaRecorder(stream as MediaStream, { mimeType }) as unknown as RecorderLike,
++    blobToBase64: (blob) =>
++      new Promise((resolve, reject) => {
++        const reader = new FileReader();
++        reader.addEventListener("error", () =>
++          reject(reader.error ?? new Error("Could not read the recording.")),
++        );
++        reader.addEventListener("load", () => {
++          const result = typeof reader.result === "string" ? reader.result : "";
++          resolve(result.slice(result.indexOf(",") + 1));
++        });
++        reader.readAsDataURL(blob);
++      }),
++    async copyToClipboard(text) {
++      try {
++        if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return false;
++        await navigator.clipboard.writeText(text);
++        return true;
++      } catch {
++        return false;
++      }
++    },
++    notify: (notice) => {
++      toastManager.add(notice);
++    },
++    onEscape(handler) {
++      const onKeyDown = (event: KeyboardEvent) => {
++        if (event.key !== "Escape") return;
++        event.preventDefault();
++        event.stopPropagation();
++        handler();
++      };
++      window.addEventListener("keydown", onKeyDown, true);
++      return () => window.removeEventListener("keydown", onKeyDown, true);
++    },
++    now: () => Date.now(),
++    setTimeout: (handler, ms) => window.setTimeout(handler, ms),
++    clearTimeout: (handle) => window.clearTimeout(handle as number),
++  };
++}
++
++/** The app-wide session: there is one microphone. */
++export const dictationSession: DictationSessionStore = createDictationSessionStore(browserDeps());
++
++export function useDictationSession(): DictationSnapshot {
++  return useSyncExternalStore(
++    dictationSession.subscribe,
++    dictationSession.getSnapshot,
++    dictationSession.getSnapshot,
++  );
++}
++
++/** True while any session is starting, recording or transcribing. */
++export function useIsDictating(): boolean {
++  return useDictationSession().phase !== "idle";
++}
+diff --git a/packages/contracts/src/ipc.ts b/packages/contracts/src/ipc.ts
+index d1f6b34939..fc18b69d7a 100644
+--- a/packages/contracts/src/ipc.ts
++++ b/packages/contracts/src/ipc.ts
+@@ -1026,6 +1026,17 @@ export const DesktopPreviewRecordingSaveInputSchema = Schema.Struct({
+ export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
+ export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
+ 
++export interface DesktopDictationStatus {
++  readonly available: boolean;
++  /** Where clips go, e.g. `http://127.0.0.1:8178/inference via ssh pgx`. */
++  readonly backend: string | null;
++  readonly detail: string | null;
++}
++
++export type DesktopDictationOutcome =
++  | { readonly ok: true; readonly text: string }
++  | { readonly ok: false; readonly message: string };
++
+ export interface DesktopBridge {
+   getAppBranding: () => DesktopAppBranding | null;
+   getRelayTelemetryEnabled?: () => boolean;
+@@ -1121,6 +1132,17 @@ export interface DesktopBridge {
+    * Optional: older desktop builds lack it; callers fall back to VS Code only.
+    */
+   probeRemoteEditors?: () => Promise<readonly EditorId[]>;
++  /**
++   * Dictation (patched builds): the desktop sends clips to a whisper.cpp
++   * server itself, so it works against unpatched T3 servers. Absent on web
++   * and mobile, where the mic button is not shown.
++   */
++  getDictationStatus?: (force?: boolean) => Promise<DesktopDictationStatus>;
++  transcribeDictation?: (request: {
++    readonly audioBase64: string;
++    readonly mimeType: string;
++    readonly language?: string;
++  }) => Promise<DesktopDictationOutcome>;
+   pasteAsText?: () => Promise<void>;
+   onMenuAction: (listener: (action: string) => void) => () => void;
+   onSnapShotEvent?: (listener: (event: DesktopSnapShotEvent) => void) => () => void;
+-- 
+2.43.0
+
