@@ -64,6 +64,8 @@ MAX_AGENT_ATTEMPTS="${env_MAX_AGENT_ATTEMPTS:-$MAX_AGENT_ATTEMPTS}"
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/run-$(date +%Y%m%dT%H%M%S).log"
+# Keep the newest 60 logs (about two weeks of 6-hourly runs).
+ls -1t "$STATE_DIR"/run-*.log 2>/dev/null | tail -n +60 | xargs -r rm -f
 exec > >(tee -a "$LOG") 2>&1
 exec 9>"$STATE_DIR/lock"
 flock -n 9 || { echo "another self-repair run is active"; exit 0; }
