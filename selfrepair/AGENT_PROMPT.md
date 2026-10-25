@@ -22,7 +22,13 @@ Goal, in this order:
 3. Finish with: no `git am` in progress, clean `git status`, exactly one commit per patch on top of
    {{TAG}} with the original subjects (`git log --oneline {{TAG}}..HEAD`), and the gate passing.
 
+Do not commit the pnpm-lock.yaml changes that `pnpm install` makes on this machine
+(packageManagerDependencies); only commit lockfile changes a patch itself needs.
+
 What the patches are, so you can tell what "working" means:
+- 0000-upstream-<sha>-*: a backport of an upstream commit (pins patched dependency versions so the
+  Windows server sidecar install works). The script skips it once the tag contains <sha>. If it
+  conflicts, resolve towards upstream's newer state while keeping the pins.
 - 0001 burn-rate meter: a flame button in the composer footer (BurnRateMeter.tsx), fed by the
   selected provider's usageLimits; tests in BurnRateMeter.logic.test.ts.
 - 0002 dictation: a mic button in the composer (DictationButton.tsx, dictationSession.ts,

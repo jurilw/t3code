@@ -13,6 +13,9 @@ name: Release patched T3 Code
 #   - from now on:   gh variable set PUBLISH_MODE -R jurilw/t3code --body release
 # Manual runs can pick draft | prerelease | release for that run.
 #
+# 0000-upstream-<sha>-* backports an upstream build fix (pinned patched
+# dependencies; without it the Windows server sidecar install fails with
+# ERR_PNPM_UNUSED_PATCH for node-pty) and is skipped once the tag contains it.
 # Patches 0001 (burn meter) and 0002 (dictation) change the desktop and web
 # client only. 0003 (legacy V1 thread import) changes the server bundled as
 # the desktop's local backend. SSH and WSL environments keep the official
@@ -108,12 +111,23 @@ jobs:
       - name: Apply patches
         shell: bash
         working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "side-quests-ci"
           git config user.email "side-quests-ci@users.noreply.github.com"
           for patch in ../ci/patches/*.patch; do
-            echo "Applying $patch"
+            name="$(basename "$patch")"
+            # NNNN-upstream-<sha>-*.patch backports an upstream commit; skip it once the tag has it.
+            if [[ "$name" =~ ^[0-9]+-upstream-([0-9a-f]{7,40})- ]]; then
+              status="$(gh api "repos/$UPSTREAM/compare/${BASH_REMATCH[1]}...$TAG" --jq .status)"
+              if [ "$status" = ahead ] || [ "$status" = identical ]; then
+                echo "Skipping $name: $TAG already contains upstream ${BASH_REMATCH[1]}"
+                continue
+              fi
+            fi
+            echo "Applying $name"
             git am --3way "$patch"
           done
 

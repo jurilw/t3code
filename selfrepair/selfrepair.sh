@@ -47,12 +47,19 @@ STATE_DIR="${STATE_DIR:-$HOME/.local/state/t3code-selfrepair}"
 CONFIG="${CONFIG:-$HOME/.config/t3code-selfrepair/config.env}"
 CLAUDE_MAX_ENDS=2026-11-15
 
+# Precedence: environment > config file > defaults.
+env_AGENT="${AGENT-}" env_AGENT_TIMEOUT="${AGENT_TIMEOUT-}" env_NOTIFY_CMD="${NOTIFY_CMD-}"
+env_MAX_AGENT_ATTEMPTS="${MAX_AGENT_ATTEMPTS-}"
 AGENT=auto
 AGENT_TIMEOUT=45m
 NOTIFY_CMD=""
 MAX_AGENT_ATTEMPTS=2
 # shellcheck disable=SC1090
-[ -f "$CONFIG" ] && . "$CONFIG"
+if [ -f "$CONFIG" ]; then . "$CONFIG"; fi
+AGENT="${env_AGENT:-$AGENT}"
+AGENT_TIMEOUT="${env_AGENT_TIMEOUT:-$AGENT_TIMEOUT}"
+NOTIFY_CMD="${env_NOTIFY_CMD:-$NOTIFY_CMD}"
+MAX_AGENT_ATTEMPTS="${env_MAX_AGENT_ATTEMPTS:-$MAX_AGENT_ATTEMPTS}"
 
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$STATE_DIR"
@@ -87,10 +94,14 @@ stuck() {
 
 # ---------------------------------------------------------------- 1. anything to do?
 command -v gh >/dev/null || { echo "gh not found" >&2; exit 1; }
-git -C "$CI_REPO" diff --quiet HEAD -- patches ci .github selfrepair ||
-  stuck "$CI_REPO has uncommitted changes in tracked pipeline files; refusing to touch it"
-git -C "$CI_REPO" checkout -q "$BRANCH"
-git -C "$CI_REPO" pull -q --ff-only fork "$BRANCH"
+# --check tests the working tree as it is (e.g. freshly copied patches); the other modes
+# commit and push, so they start from a clean, current branch.
+if [ "$MODE" != check ]; then
+  git -C "$CI_REPO" diff --quiet HEAD -- patches ci .github selfrepair ||
+    stuck "$CI_REPO has uncommitted changes in tracked pipeline files; refusing to touch it"
+  git -C "$CI_REPO" checkout -q "$BRANCH"
+  git -C "$CI_REPO" pull -q --ff-only fork "$BRANCH"
+fi
 
 TAG="${TAG:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}"
 say "upstream stable: $TAG (mode $MODE)"
@@ -111,15 +122,6 @@ if [ "$MODE" = run ]; then
 fi
 
 # ---------------------------------------------------------------- 2. apply patches on the tag
-mapfile -t PATCHES < <(ls "$CI_REPO"/patches/*.patch | sort)
-[ "${#PATCHES[@]}" -gt 0 ] || stuck "no patches in $CI_REPO/patches"
-# Subject headers can be folded over several lines in a patch file.
-patch_subject() {
-  awk '/^Subject: /{s=substr($0,10); while ((getline line) > 0 && line ~ /^[ \t]/) s=s line; print s; exit}' "$1" |
-    sed 's/^\[PATCH[^]]*\] //'
-}
-mapfile -t SUBJECTS < <(for p in "${PATCHES[@]}"; do patch_subject "$p"; done)
-
 git -C "$UPSTREAM_REPO" fetch -q origin --tags
 git -C "$UPSTREAM_REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null || stuck "tag $TAG not found upstream"
 rm -rf "$WORK"
@@ -127,6 +129,28 @@ git clone -q --shared --no-checkout "$UPSTREAM_REPO" "$WORK"
 git -C "$WORK" checkout -q -b "selfrepair/$TAG" "$TAG"
 git -C "$WORK" config user.name "jurilw"
 git -C "$WORK" config user.email "washington.juri@gmail.com"
+
+# NNNN-upstream-<sha>-*.patch are backports of upstream commits; once the tag contains the
+# commit they are obsolete (skipped here and in CI, deleted in the refresh commit).
+PATCHES=()
+OBSOLETE=()
+for patch in $(ls "$CI_REPO"/patches/*.patch | sort); do
+  name="$(basename "$patch")"
+  if [[ "$name" =~ ^[0-9]+-upstream-([0-9a-f]{7,40})- ]] &&
+    git -C "$WORK" merge-base --is-ancestor "${BASH_REMATCH[1]}" "$TAG" 2>/dev/null; then
+    say "skipping $name: $TAG already contains upstream ${BASH_REMATCH[1]}"
+    OBSOLETE+=("$patch")
+  else
+    PATCHES+=("$patch")
+  fi
+done
+[ "${#PATCHES[@]}" -gt 0 ] || stuck "no patches in $CI_REPO/patches"
+# Subject headers can be folded over several lines in a patch file.
+patch_subject() {
+  awk '/^Subject: /{s=substr($0,10); while ((getline line) > 0 && line ~ /^[ \t]/) s=s line; print s; exit}' "$1" |
+    sed 's/^\[PATCH[^]]*\] //'
+}
+mapfile -t SUBJECTS < <(for p in "${PATCHES[@]}"; do patch_subject "$p"; done)
 
 applied_all=true
 for patch in "${PATCHES[@]}"; do
@@ -199,6 +223,8 @@ fi
 
 # ---------------------------------------------------------------- 4. verify independently
 [ ! -d "$WORK/.git/rebase-apply" ] || stuck "git am still in progress in $WORK after the agent"
+# pnpm install on pgx rewrites packageManagerDependencies in the lockfile; not part of any patch.
+git -C "$WORK" checkout -q -- pnpm-lock.yaml 2>/dev/null || true
 [ -z "$(git -C "$WORK" status --porcelain --untracked-files=no)" ] || stuck "uncommitted changes left in $WORK"
 mapfile -t GOT < <(git -C "$WORK" log --reverse --format=%s "$TAG..HEAD")
 [ "${#GOT[@]}" -eq "${#PATCHES[@]}" ] ||
@@ -225,8 +251,9 @@ if [ "$MODE" = dry-run ]; then
 fi
 for i in "${!PATCHES[@]}"; do cp "${NEW[$i]}" "${PATCHES[$i]}"; done
 rm -rf "$out"
+for patch in "${OBSOLETE[@]}"; do git -C "$CI_REPO" rm -q -- "patches/$(basename "$patch")"; done
 
-if git -C "$CI_REPO" diff --quiet -- patches; then
+if [ -z "$(git -C "$CI_REPO" status --porcelain -- patches)" ]; then
   say "patches unchanged (the failure was not a patch problem)"
 else
   git -C "$CI_REPO" add patches

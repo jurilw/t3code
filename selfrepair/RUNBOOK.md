@@ -8,7 +8,7 @@ context. Every step has a command and an acceptance check. Run everything on **p
 | Thing | Where |
 |---|---|
 | Pipeline repo (this repo) | `~/src/t3code-sq-ci`, branch `patched-releases`, remote `fork` = github.com/jurilw/t3code |
-| Patches (git format-patch vs upstream tag) | `patches/0001-burn-rate-meter.patch`, `0002-dictation.patch`, `0003-legacy-v1-thread-import.patch` |
+| Patches (git format-patch vs upstream tag) | `patches/0000-upstream-22840ab943-pin-patched-deps.patch` (backport of upstream #23798; skipped automatically once a tag contains 22840ab943), `0001-burn-rate-meter.patch`, `0002-dictation.patch`, `0003-legacy-v1-thread-import.patch` |
 | Release workflow | `.github/workflows/release.yml` (every 6 h, or manual) |
 | Release gate (tests + wiring) | `ci/gate.sh <src>`; post-build bundle check `ci/verify-build.sh <src>` |
 | Self-repair script | `selfrepair/selfrepair.sh` (cron on pgx, see below) |
@@ -60,8 +60,9 @@ writes `~/.local/state/t3code-selfrepair/STUCK-<tag>.md`. To do the same by hand
        # edit files so the patch does what its commit message says on the new code
        git add -A && git am --continue
        for p in <remaining patches in order>; do git am --3way ~/src/t3code-sq-ci/patches/$p; done
-   Accept: `git log --oneline <tag>..HEAD` shows exactly 3 commits with the original subjects;
-   `git status` is clean.
+   Accept: `git log --oneline <tag>..HEAD` shows one commit per applied patch (4, or 3 once the
+   tag contains the upstream backport) with the original subjects; `git status` is clean apart
+   from pnpm-lock.yaml (`git checkout -- pnpm-lock.yaml`).
 
 4. Run the gate.
 
@@ -75,9 +76,12 @@ writes `~/.local/state/t3code-selfrepair/STUCK-<tag>.md`. To do the same by hand
        cd ~/src/t3code-selfrepair
        out=$(mktemp -d) && git format-patch -q <tag>..HEAD -o "$out"
        cd ~/src/t3code-sq-ci
-       cp "$out"/0001-*.patch patches/0001-burn-rate-meter.patch
-       cp "$out"/0002-*.patch patches/0002-dictation.patch
-       cp "$out"/0003-*.patch patches/0003-legacy-v1-thread-import.patch
+       ls "$out"    # one file per commit, in order; copy each over the patches/ file it came from:
+       #   commit "fix(deps): pin all patched ..."   -> patches/0000-upstream-22840ab943-pin-patched-deps.patch
+       #   commit "feat(composer): usage burn-rate"  -> patches/0001-burn-rate-meter.patch
+       #   commit "feat(composer): local dictation"  -> patches/0002-dictation.patch
+       #   commit "fix(persistence): import V1 ..."  -> patches/0003-legacy-v1-thread-import.patch
+       # (if the tag already contains the upstream backport: git rm patches/0000-upstream-*.patch)
        bash selfrepair/selfrepair.sh --check       # must print CHECK PASSED for <tag>
        git add patches && git commit -m "Refresh patches onto upstream <tag>" \
          -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
