@@ -100,13 +100,54 @@ writes `~/.local/state/t3code-selfrepair/STUCK-<tag>.md`. To do the same by hand
 
 ## If the failure is in the build, not the patches
 
-`selfrepair.sh` re-dispatches up to 3 times per tag, then reports STUCK. Look at the failed step:
+If the patches did not change (the "From <sha>" header lines do not count) and the newest
+release run for the current commit failed, `selfrepair.sh` does not re-dispatch: it writes
+STUCK with the last 60 lines of the failed log. It also stops after 3 dispatches per tag (checked
+before it commits or pushes). Look at the failed step:
 
     gh run view <run-id> -R jurilw/t3code --log-failed | tail -80
 
 Typical causes: runner image changes (pin in `runs-on`), upstream changed
 `scripts/build-desktop-artifact.ts` flags, a new required secret. Fix the workflow, commit,
 push, re-run step 6.
+
+## Gate passes on pgx, fails in CI
+
+Symptom: `selfrepair.sh --check` prints `CHECK PASSED`, but the release run fails in
+"Release gate" (or a later step) with an error pgx never shows. Cause seen on v0.1.3: CI installs
+only the projects selected by the `vp install --filter=...` line in release.yml, and the gate
+loaded a project outside them (apps/mobile). On pgx a full install, and pnpm's root fallback dir
+`node_modules/.pnpm/node_modules`, hide this.
+
+1. Reproduce CI's install on pgx.
+
+       cd ~/src/t3code-sq-ci
+       bash ci/repro-ci-install.sh <tag> | tail -1
+   It clones the tag fresh under /tmp, applies patches/, installs with the exact filter line from
+   release.yml, hides the fallback dir during `vp test`, and runs ci/gate.sh.
+   Accept: the same error as the CI log, last line `GATE FAIL: ...`. (`KEEP=1` keeps the scratch
+   dir; `CI_HOIST=1` turns the emulation off.) If it prints `GATE PASS`, the cause is elsewhere:
+   compare the failed CI step with `gh run view <id> -R jurilw/t3code --log-failed | tail -80`.
+
+2. Fix it in this repo, not by installing more in CI. For a project the gate should not load:
+   run its checks from the package directory (as `ci/gate.sh` does for tests) so only that
+   package's config is read. Only if a patched feature really needs the package, widen the
+   `--filter` line in release.yml.
+
+3. Re-run step 1. Accept: `bash ci/repro-ci-install.sh <tag> | tail -1 | grep -qx "GATE PASS"`.
+   Also `bash selfrepair/tests/test_selfrepair.sh` if you touched selfrepair.sh.
+
+4. Commit by explicit path (`git add ci/gate.sh ...`, never `git add -A`), push to
+   `fork patched-releases`, delete `~/.local/state/t3code-selfrepair/STUCK-<tag>.md`, then re-run
+   the release (step 6 above).
+
+## Notifications
+
+`NOTIFY_CMD` in `~/.config/t3code-selfrepair/config.env` is `bash $HOME/src/t3code-sq-ci/selfrepair/notify.sh`.
+It appends every STUCK note, stamped in UTC, to `~/.local/state/t3code-selfrepair/ATTENTION.md`.
+It also sends the note through the tracker's Telegram bot only if `NOTIFY_TELEGRAM=1` is set in the
+config (Juri decides). Test: `echo test | NOTIFY_DRY_RUN=1 NOTIFY_TELEGRAM=1 bash selfrepair/notify.sh`
+(prints the payload, sends nothing).
 
 ## Approving a release (Juri only)
 
