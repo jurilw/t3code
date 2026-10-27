@@ -1,4 +1,4 @@
-From dbd51269c962b2f2907a1827c48b9bef847041d4 Mon Sep 17 00:00:00 2001
+From 62db33061b185ead2f39bb658d4f8a4aee7968fb Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:35:42 +0000
 Subject: [PATCH 2/3] feat(composer): local dictation through the desktop app
@@ -702,10 +702,10 @@ index 0000000000..8c9bd57005
 +  }),
 +});
 diff --git a/apps/desktop/src/preload.ts b/apps/desktop/src/preload.ts
-index bffa02d9ca..8fe447de55 100644
+index 4d57b30e21..7dee211858 100644
 --- a/apps/desktop/src/preload.ts
 +++ b/apps/desktop/src/preload.ts
-@@ -207,6 +207,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
+@@ -206,6 +206,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
    openSystemSettings: (pane: string) =>
      ipcRenderer.invoke(IpcChannels.OPEN_SYSTEM_SETTINGS_CHANNEL, pane),
    probeRemoteEditors: () => ipcRenderer.invoke(IpcChannels.PROBE_REMOTE_EDITORS_CHANNEL, undefined),
@@ -717,10 +717,10 @@ index bffa02d9ca..8fe447de55 100644
    onMenuAction: (listener) => {
      const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index af88378b68..8146909bc8 100644
+index 79525f870c..958909e62a 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -205,6 +205,8 @@ import {
+@@ -192,6 +192,8 @@ import {
  } from "./ComposerAttachmentStrip";
  import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
  import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
@@ -729,7 +729,7 @@ index af88378b68..8146909bc8 100644
  import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
  import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
  import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
-@@ -2349,7 +2351,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -2298,7 +2300,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
        upload.environmentId === environmentId;
      return nonPersistedComposerImageIdSet.has(image.id) && !failedInCurrentEnvironment;
    });
@@ -739,9 +739,9 @@ index af88378b68..8146909bc8 100644
    const composerHasExpandedChrome =
 +    isDictating ||
      showComposerTopDrawer ||
-     isTasksDrawerOpen ||
      composerMenuOpen ||
-@@ -2686,6 +2692,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     isStashMenuOpen ||
+@@ -2598,6 +2604,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
      );
    };
    const insertComposerTextStable = useStableCallback(insertComposerText);
@@ -753,7 +753,7 @@ index af88378b68..8146909bc8 100644
  
    const insertAttachmentReferences = (
      references: ReadonlyArray<ComposerContextReference>,
-@@ -3898,6 +3909,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -3772,6 +3783,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                    }
                    className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
                  >
@@ -1792,10 +1792,10 @@ index 0000000000..3449f18f6e
 +  return useDictationSession().phase !== "idle";
 +}
 diff --git a/packages/contracts/src/ipc.ts b/packages/contracts/src/ipc.ts
-index d1f6b34939..fc18b69d7a 100644
+index b353eca721..2c90ab336f 100644
 --- a/packages/contracts/src/ipc.ts
 +++ b/packages/contracts/src/ipc.ts
-@@ -1026,6 +1026,17 @@ export const DesktopPreviewRecordingSaveInputSchema = Schema.Struct({
+@@ -1002,6 +1002,17 @@ export const DesktopPreviewRecordingSaveInputSchema = Schema.Struct({
  export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
  export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
  
@@ -1813,9 +1813,9 @@ index d1f6b34939..fc18b69d7a 100644
  export interface DesktopBridge {
    getAppBranding: () => DesktopAppBranding | null;
    getRelayTelemetryEnabled?: () => boolean;
-@@ -1121,6 +1132,17 @@ export interface DesktopBridge {
-    * Optional: older desktop builds lack it; callers fall back to VS Code only.
-    */
+@@ -1094,6 +1105,17 @@ export interface DesktopBridge {
+   checkSystemPermission?: (pane: SystemSettingsPane) => Promise<boolean>;
+   /** Older builds lack this; fall back to VS Code only. */
    probeRemoteEditors?: () => Promise<readonly EditorId[]>;
 +  /**
 +   * Dictation (patched builds): the desktop sends clips to a whisper.cpp

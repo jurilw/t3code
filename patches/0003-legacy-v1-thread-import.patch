@@ -1,4 +1,4 @@
-From 33031b36c02b6a0b4dc876a4219c647047d8f277 Mon Sep 17 00:00:00 2001
+From 53036d41405432cc010670fd5f2676fc63bba9c0 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:41:17 +0000
 Subject: [PATCH 3/3] fix(persistence): import V1 threads created after the V2
@@ -42,7 +42,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 apps/server/src/persistence/legacyV1Resync.ts
 
 diff --git a/apps/server/src/persistence/initializeV2Database.ts b/apps/server/src/persistence/initializeV2Database.ts
-index 7f63bb9c4c..14167bfe94 100644
+index 755907b507..b5d5586e89 100644
 --- a/apps/server/src/persistence/initializeV2Database.ts
 +++ b/apps/server/src/persistence/initializeV2Database.ts
 @@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
@@ -62,7 +62,7 @@ index 7f63bb9c4c..14167bfe94 100644
    yield* Effect.gen(function* () {
      if (yield* fs.exists(destinationPath)) return;
      if (!(yield* fs.exists(sourcePath))) return;
-@@ -50,4 +53,18 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
+@@ -49,4 +52,18 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
      Effect.scoped,
      Effect.mapError((cause) => new V2DatabaseImportError({ sourcePath, destinationPath, cause })),
    );

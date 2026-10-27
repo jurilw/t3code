@@ -1,4 +1,4 @@
-From dc08c012d58feb046dd7e4e22bb1b44ceda8bc9a Mon Sep 17 00:00:00 2001
+From 3e1cbb8c997b156c038a4eb71ab34718c54b0ba9 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Tue, 20 Oct 2026 18:05:49 +0100
 Subject: [PATCH 1/3] feat(composer): usage burn-rate meter
@@ -726,10 +726,10 @@ index 0000000000..43b3dba72b
 +  );
 +}
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index b74e691ddd..af88378b68 100644
+index d7b46eea0a..79525f870c 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -3906,6 +3906,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -3780,6 +3780,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                        settings.contextWindowMeterEnabled ? activeContextWindow : null
                      }
                      reserveContextWindowMeter={reserveContextWindowMeter}
@@ -738,7 +738,7 @@ index b74e691ddd..af88378b68 100644
                      pendingAction={pendingPrimaryAction}
                      isRunning={phase === "running"}
 diff --git a/apps/web/src/components/chat/ComposerFooterControls.tsx b/apps/web/src/components/chat/ComposerFooterControls.tsx
-index 4e4ebac157..3d5a6102c2 100644
+index 22a8790c17..6335a22855 100644
 --- a/apps/web/src/components/chat/ComposerFooterControls.tsx
 +++ b/apps/web/src/components/chat/ComposerFooterControls.tsx
 @@ -1,5 +1,6 @@
@@ -748,15 +748,15 @@ index 4e4ebac157..3d5a6102c2 100644
    ProviderInstanceId,
    ProviderInteractionMode,
    RuntimeMode,
-@@ -19,6 +20,7 @@ import {
- } from "./ComposerControl";
+@@ -14,6 +15,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { ComposerControl, ComposerControlIcon, ComposerSelectControl } from "./ComposerControl";
  import { useComposerMenuProps } from "./composerEventScope";
  import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 +import { BurnRateMeter } from "./BurnRateMeter";
  import { ContextWindowMeter, ContextWindowMeterPlaceholder } from "./ContextWindowMeter";
  import { resolveModelPickerSelectedModel } from "./ModelPickerContent";
  import { ProviderModelPicker } from "./ProviderModelPicker";
-@@ -152,6 +154,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
+@@ -142,6 +144,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
    canOperateThread: boolean;
    activeContextWindow: ContextWindowSnapshot | null;
    reserveContextWindowMeter: boolean;
@@ -765,7 +765,7 @@ index 4e4ebac157..3d5a6102c2 100644
    activeThreadModelDisplayName: string | null;
    isPreparingWorktree: boolean;
    pendingAction: {
-@@ -190,6 +194,9 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
+@@ -180,6 +184,9 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
  }) {
    return (
      <>
