@@ -65,7 +65,8 @@ export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/run-$(date +%Y%m%dT%H%M%S).log"
 # Keep the newest 60 logs (about two weeks of 6-hourly runs).
-ls -1t "$STATE_DIR"/run-*.log 2>/dev/null | tail -n +60 | xargs -r rm -f
+# (ls fails when there are no logs yet; with pipefail that used to end a first run here.)
+{ ls -1t "$STATE_DIR"/run-*.log 2>/dev/null || true; } | tail -n +60 | xargs -r rm -f
 exec > >(tee -a "$LOG") 2>&1
 exec 9>"$STATE_DIR/lock"
 flock -n 9 || { echo "another self-repair run is active"; exit 0; }
@@ -73,7 +74,7 @@ flock -n 9 || { echo "another self-repair run is active"; exit 0; }
 say() { echo "[$(date '+%F %T')] $*"; }
 
 stuck() {
-  local reason="$1"
+  local reason="$1" detail="${2:-}"
   local file="$STATE_DIR/STUCK-${TAG:-unknown}.md"
   if [ "$MODE" = check ]; then say "CHECK FAILED: $reason"; exit 3; fi
   # Only real runs leave a STUCK note (it pauses the cron job for this tag).
@@ -86,6 +87,10 @@ stuck() {
     echo "Log: $LOG"
     echo "Scratch checkout (left as is): $WORK"
     echo "Manual steps: $CI_REPO/selfrepair/RUNBOOK.md"
+    if [ -n "$detail" ]; then
+      echo
+      echo "$detail"
+    fi
   } >"$file"
   say "STUCK: $reason (wrote $file)"
   if [ -n "$NOTIFY_CMD" ] && [ ! -f "$file.notified" ] && [ "$MODE" = run ]; then
@@ -255,9 +260,34 @@ for i in "${!PATCHES[@]}"; do cp "${NEW[$i]}" "${PATCHES[$i]}"; done
 rm -rf "$out"
 for patch in "${OBSOLETE[@]}"; do git -C "$CI_REPO" rm -q -- "patches/$(basename "$patch")"; done
 
-if [ -z "$(git -C "$CI_REPO" status --porcelain -- patches)" ]; then
+# Every refresh rewrites the "From <commit sha>" line at the top of each patch (new commit ids
+# on the scratch branch). That alone is not a change; only content changes count.
+if git -C "$CI_REPO" diff --quiet HEAD -I '^From [0-9a-f]{40} ' -- patches; then
+  git -C "$CI_REPO" checkout -q HEAD -- patches
+  patches_changed=false
   say "patches unchanged (the failure was not a patch problem)"
+  # Re-dispatching the same commit cannot fix a build failure; hand it over with the log.
+  head="$(git -C "$CI_REPO" rev-parse HEAD)"
+  read -r run_id run_conclusion < <(gh run list -R "$FORK" --workflow release.yml --commit "$head" \
+    --limit 1 --json databaseId,conclusion --jq '.[0] // empty | "\(.databaseId) \(.conclusion)"') || true
+  if [ "${run_conclusion:-}" = failure ]; then
+    excerpt="$(gh run view "$run_id" -R "$FORK" --log-failed 2>&1 | tail -n 60)"
+    stuck "release run $run_id failed on ${head:0:7} with patches that apply and pass the local gate; re-dispatching the same commit will not help" \
+      "$(printf 'Last 60 lines of `gh run view %s -R %s --log-failed`:\n\n```\n%s\n```' "$run_id" "$FORK" "$excerpt")"
+  fi
 else
+  patches_changed=true
+fi
+
+# The dispatch cap is checked before anything is committed or pushed.
+dispatches_file="$STATE_DIR/dispatches-$TAG"
+dispatches=$(cat "$dispatches_file" 2>/dev/null || echo 0)
+if [ "$dispatches" -ge 3 ]; then
+  git -C "$CI_REPO" checkout -q HEAD -- patches
+  stuck "dispatched $dispatches times for $TAG without a release"
+fi
+
+if $patches_changed; then
   git -C "$CI_REPO" add patches
   git -C "$CI_REPO" commit -q -F - <<EOF
 Refresh patches onto upstream $TAG
@@ -270,9 +300,6 @@ EOF
 fi
 
 git -C "$CI_REPO" push -q fork "$BRANCH"
-dispatches_file="$STATE_DIR/dispatches-$TAG"
-dispatches=$(cat "$dispatches_file" 2>/dev/null || echo 0)
-[ "$dispatches" -lt 3 ] || stuck "dispatched $dispatches times for $TAG without a release"
 echo $((dispatches + 1)) >"$dispatches_file"
 gh workflow run release.yml -R "$FORK" --ref "$BRANCH" -f tag="$TAG"
 say "pushed and dispatched the release workflow for $TAG"
