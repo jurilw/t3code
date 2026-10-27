@@ -1,4 +1,4 @@
-From 62db33061b185ead2f39bb658d4f8a4aee7968fb Mon Sep 17 00:00:00 2001
+From 1cf1e4752c66a41bcd9bca4fc1418f0b1d3a2eb8 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:35:42 +0000
 Subject: [PATCH 2/3] feat(composer): local dictation through the desktop app
