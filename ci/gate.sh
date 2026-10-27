@@ -35,13 +35,19 @@ grep -q "resyncLegacyV1Threads" apps/server/src/persistence/initializeV2Database
   fail "legacy V1 thread import not hooked into startup"
 
 echo "== tests"
-vp test run \
-  apps/web/src/components/chat/BurnRateMeter.logic.test.ts \
-  apps/web/src/components/chat/dictationSession.test.ts \
-  apps/web/src/components/chat/dictationAvailability.test.ts \
-  apps/desktop/src/dictation/whisperTranscription.test.ts \
-  apps/server/src/persistence/legacyV1Resync.test.ts \
-  apps/server/src/persistence/initializeV2Database.test.ts
+# Run each package's tests from its own directory, so vitest loads only that package's config.
+# From the repo root, vite.config.ts declares every app as a vitest project, and vitest loads
+# all project configs before any --project or file filter applies. Since v0.1.3 that includes
+# apps/mobile, whose config requires @babel/core, and release.yml does not install apps/mobile
+# (Startup Error: Cannot find module '@babel/core', run 40563357027).
+pkg_tests() {
+  local dir="$1"
+  shift
+  (cd "$dir" && vp test run "$@") || fail "tests failed in $dir"
+}
+pkg_tests apps/web --project unit   src/components/chat/BurnRateMeter.logic.test.ts   src/components/chat/dictationSession.test.ts   src/components/chat/dictationAvailability.test.ts
+pkg_tests apps/desktop src/dictation/whisperTranscription.test.ts
+pkg_tests apps/server   src/persistence/legacyV1Resync.test.ts   src/persistence/initializeV2Database.test.ts
 
 echo "== typecheck"
 for package in @t3tools/contracts @t3tools/web @t3tools/desktop t3; do
