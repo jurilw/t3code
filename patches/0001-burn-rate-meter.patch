@@ -1,4 +1,4 @@
-From 30b674e332b40014dff5c67cf26707c6b3640bee Mon Sep 17 00:00:00 2001
+From 25b5817a9eefdba09873ed24f91145bd0f70fef4 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Tue, 20 Oct 2026 18:05:49 +0100
 Subject: [PATCH 1/3] feat(composer): usage burn-rate meter
@@ -726,19 +726,19 @@ index 0000000000..43b3dba72b
 +  );
 +}
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index d7b46eea0a..79525f870c 100644
+index 57838e5981..e3f32a4f2f 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -3780,6 +3780,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -3453,6 +3453,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                        settings.contextWindowMeterEnabled ? activeContextWindow : null
                      }
                      reserveContextWindowMeter={reserveContextWindowMeter}
-+                    usageLimitsProvider={isComposerResting ? null : selectedProviderStatus}
++                    usageLimitsProvider={selectedProviderStatus}
                      activeThreadModelDisplayName={activeThreadModelDisplayName}
                      pendingAction={pendingPrimaryAction}
                      isRunning={phase === "running"}
 diff --git a/apps/web/src/components/chat/ComposerFooterControls.tsx b/apps/web/src/components/chat/ComposerFooterControls.tsx
-index 22a8790c17..6335a22855 100644
+index 46de66194d..5a87cef334 100644
 --- a/apps/web/src/components/chat/ComposerFooterControls.tsx
 +++ b/apps/web/src/components/chat/ComposerFooterControls.tsx
 @@ -1,5 +1,6 @@
@@ -748,15 +748,15 @@ index 22a8790c17..6335a22855 100644
    ProviderInstanceId,
    ProviderInteractionMode,
    RuntimeMode,
-@@ -14,6 +15,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
- import { ComposerControl, ComposerControlIcon, ComposerSelectControl } from "./ComposerControl";
- import { useComposerMenuProps } from "./composerEventScope";
+@@ -15,6 +16,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { ComposerControl, ComposerControlIcon } from "./ComposerControl";
+ import { focusRequestedPermission, useComposerMenuProps } from "./composerEventScope";
  import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 +import { BurnRateMeter } from "./BurnRateMeter";
  import { ContextWindowMeter, ContextWindowMeterPlaceholder } from "./ContextWindowMeter";
  import { resolveModelPickerSelectedModel } from "./ModelPickerContent";
  import { ProviderModelPicker } from "./ProviderModelPicker";
-@@ -142,6 +144,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
+@@ -246,6 +248,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
    canOperateThread: boolean;
    activeContextWindow: ContextWindowSnapshot | null;
    reserveContextWindowMeter: boolean;
@@ -765,7 +765,7 @@ index 22a8790c17..6335a22855 100644
    activeThreadModelDisplayName: string | null;
    isPreparingWorktree: boolean;
    pendingAction: {
-@@ -180,6 +184,9 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
+@@ -283,6 +287,9 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
  }) {
    return (
      <>
