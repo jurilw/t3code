@@ -1,4 +1,4 @@
-From a221baa943a0d364293af82fa6d0d04272239230 Mon Sep 17 00:00:00 2001
+From 32d485cb38c6bcac766d67297f5222fa78ca3d99 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:35:42 +0000
 Subject: [PATCH 2/3] feat(composer): local dictation through the desktop app
@@ -618,7 +618,7 @@ index 35333ac3d3..ba8b0516a9 100644
    yield* ipc.handle(setUpdateChannel);
    yield* ipc.handle(downloadUpdate);
 diff --git a/apps/desktop/src/ipc/channels.ts b/apps/desktop/src/ipc/channels.ts
-index bba4f6449b..47fde58b63 100644
+index 538dd06b0b..416f5f4d97 100644
 --- a/apps/desktop/src/ipc/channels.ts
 +++ b/apps/desktop/src/ipc/channels.ts
 @@ -7,6 +7,8 @@ export const CONTEXT_MENU_CHANNEL = "desktop:context-menu";
@@ -702,10 +702,10 @@ index 0000000000..8c9bd57005
 +  }),
 +});
 diff --git a/apps/desktop/src/preload.ts b/apps/desktop/src/preload.ts
-index a3e1e711cb..75db344266 100644
+index 950ed972c6..0390fca1ff 100644
 --- a/apps/desktop/src/preload.ts
 +++ b/apps/desktop/src/preload.ts
-@@ -202,6 +202,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
+@@ -207,6 +207,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
    openSystemSettings: (pane: string) =>
      ipcRenderer.invoke(IpcChannels.OPEN_SYSTEM_SETTINGS_CHANNEL, pane),
    probeRemoteEditors: () => ipcRenderer.invoke(IpcChannels.PROBE_REMOTE_EDITORS_CHANNEL, undefined),
@@ -717,10 +717,10 @@ index a3e1e711cb..75db344266 100644
    onMenuAction: (listener) => {
      const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index e3f32a4f2f..0c1a7ddd97 100644
+index b964a268a9..3aa7087c98 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -199,6 +199,8 @@ import {
+@@ -201,6 +201,8 @@ import {
  } from "./ComposerAttachmentStrip";
  import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
  import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
@@ -729,7 +729,7 @@ index e3f32a4f2f..0c1a7ddd97 100644
  import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
  import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
  import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
-@@ -1017,12 +1019,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -1021,12 +1023,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
    const [composerMenuAnchor, setComposerMenuAnchor] = useState<HTMLDivElement | null>(null);
    const [hasWrappedPrompt, observeWrappedPrompt] = useComposerMultilinePrompt();
    const hasMultilinePrompt = prompt.includes("\n") || hasWrappedPrompt;
@@ -746,7 +746,7 @@ index e3f32a4f2f..0c1a7ddd97 100644
      !hasMultilinePrompt &&
      pendingUserInputs.length === 0;
  
-@@ -2394,6 +2400,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -2399,6 +2405,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
      );
    };
    const insertComposerTextStable = useStableCallback(insertComposerText);
@@ -758,7 +758,7 @@ index e3f32a4f2f..0c1a7ddd97 100644
  
    const insertAttachmentReferences = (
      references: ReadonlyArray<ComposerContextReference>,
-@@ -3446,6 +3457,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -3450,6 +3461,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                    >
                      {composerControls}
                    </div>
@@ -1795,10 +1795,10 @@ index 0000000000..3449f18f6e
 +  return useDictationSession().phase !== "idle";
 +}
 diff --git a/packages/contracts/src/ipc.ts b/packages/contracts/src/ipc.ts
-index 89fc70f2b7..66b7974eca 100644
+index f14452fec5..826ac01451 100644
 --- a/packages/contracts/src/ipc.ts
 +++ b/packages/contracts/src/ipc.ts
-@@ -1002,6 +1002,17 @@ export const DesktopPreviewRecordingSaveInputSchema = Schema.Struct({
+@@ -1011,6 +1011,17 @@ export const DesktopPreviewRecordingSaveInputSchema = Schema.Struct({
  export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
  export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
  
@@ -1816,7 +1816,7 @@ index 89fc70f2b7..66b7974eca 100644
  export interface DesktopBridge {
    getAppBranding: () => DesktopAppBranding | null;
    getRelayTelemetryEnabled: () => boolean;
-@@ -1088,6 +1099,17 @@ export interface DesktopBridge {
+@@ -1098,6 +1109,17 @@ export interface DesktopBridge {
    openSystemSettings: (pane: SystemSettingsPane) => Promise<boolean>;
    checkSystemPermission: (pane: SystemSettingsPane) => Promise<boolean>;
    probeRemoteEditors: () => Promise<readonly EditorId[]>;

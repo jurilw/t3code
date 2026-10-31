@@ -1,4 +1,4 @@
-From 60caa7fc6852568f8f25f285c57c893fde244118 Mon Sep 17 00:00:00 2001
+From b455db10081bbcee5b10b892b6230e0935b7d7e3 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:41:17 +0000
 Subject: [PATCH 3/3] fix(persistence): import V1 threads created after the V2
@@ -42,7 +42,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 apps/server/src/persistence/legacyV1Resync.ts
 
 diff --git a/apps/server/src/persistence/initializeV2Database.ts b/apps/server/src/persistence/initializeV2Database.ts
-index 755907b507..b5d5586e89 100644
+index 4f6d8d969c..a5fe4db216 100644
 --- a/apps/server/src/persistence/initializeV2Database.ts
 +++ b/apps/server/src/persistence/initializeV2Database.ts
 @@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
@@ -54,15 +54,15 @@ index 755907b507..b5d5586e89 100644
  export class V2DatabaseImportError extends Schema.TaggedError<V2DatabaseImportError>()(
    "V2DatabaseImportError",
    { sourcePath: Schema.String, destinationPath: Schema.String, cause: Schema.Defect() },
-@@ -22,6 +24,7 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
-   const path = yield* Path.Path;
+@@ -50,6 +52,7 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
    const directory = path.dirname(destinationPath);
    const sourcePath = path.join(directory, "state.sqlite");
+   yield* removeAbandonedCopies(directory).pipe(Effect.ignore({ log: true }));
 +  const hadV2Database = yield* fs.exists(destinationPath).pipe(Effect.orElseSucceed(() => false));
    yield* Effect.gen(function* () {
      if (yield* fs.exists(destinationPath)) return;
      if (!(yield* fs.exists(sourcePath))) return;
-@@ -49,4 +52,18 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
+@@ -77,4 +80,18 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
      Effect.scoped,
      Effect.mapError((cause) => new V2DatabaseImportError({ sourcePath, destinationPath, cause })),
    );
