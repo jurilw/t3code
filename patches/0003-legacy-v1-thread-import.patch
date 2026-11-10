@@ -1,4 +1,4 @@
-From 7ce5fb6508ab4aa73719aff0a072a52ddb016ec8 Mon Sep 17 00:00:00 2001
+From 21feb1239cc35a0d0494b10b4b0b886227ba4e7b Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:41:17 +0000
 Subject: [PATCH 3/3] fix(persistence): import V1 threads created after the V2
@@ -34,15 +34,15 @@ imported, 14_Orchestrator merged into the existing V2 project.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../src/persistence/initializeV2Database.ts   |  17 ++
+ .../src/persistence/initializeV2Database.ts   |  29 ++
  .../src/persistence/legacyV1Resync.test.ts    | 178 +++++++++++
  apps/server/src/persistence/legacyV1Resync.ts | 284 ++++++++++++++++++
- 3 files changed, 479 insertions(+)
+ 3 files changed, 491 insertions(+)
  create mode 100644 apps/server/src/persistence/legacyV1Resync.test.ts
  create mode 100644 apps/server/src/persistence/legacyV1Resync.ts
 
 diff --git a/apps/server/src/persistence/initializeV2Database.ts b/apps/server/src/persistence/initializeV2Database.ts
-index 4f6d8d969c..a5fe4db216 100644
+index 492567c798..c2c58144e3 100644
 --- a/apps/server/src/persistence/initializeV2Database.ts
 +++ b/apps/server/src/persistence/initializeV2Database.ts
 @@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
@@ -54,7 +54,23 @@ index 4f6d8d969c..a5fe4db216 100644
  export class V2DatabaseImportError extends Schema.TaggedError<V2DatabaseImportError>()(
    "V2DatabaseImportError",
    { sourcePath: Schema.String, destinationPath: Schema.String, cause: Schema.Defect() },
-@@ -50,6 +52,7 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
+@@ -16,6 +18,15 @@ export class V2DatabaseImportError extends Schema.TaggedError<V2DatabaseImportEr
+ 
+ const isV2DatabaseImportError = Schema.is(V2DatabaseImportError);
+ 
++class LegacyV1ResyncError extends Schema.TaggedError<LegacyV1ResyncError>()(
++  "LegacyV1ResyncError",
++  { sourcePath: Schema.String, destinationPath: Schema.String, cause: Schema.Defect() },
++) {
++  override get message() {
++    return `Could not copy newer V1 threads from ${this.sourcePath} into ${this.destinationPath}.`;
++  }
++}
++
+ const isProcessAlive = (pid: number): boolean => {
+   if (!Number.isInteger(pid) || pid <= 0) return false;
+   try {
+@@ -52,6 +63,7 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
    const directory = path.dirname(destinationPath);
    const sourcePath = path.join(directory, "state.sqlite");
    yield* removeAbandonedCopies(directory).pipe(Effect.ignore({ log: true }));
@@ -62,14 +78,17 @@ index 4f6d8d969c..a5fe4db216 100644
    yield* Effect.gen(function* () {
      if (yield* fs.exists(destinationPath)) return;
      if (!(yield* fs.exists(sourcePath))) return;
-@@ -77,4 +80,18 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
-     Effect.scoped,
-     Effect.mapError((cause) => new V2DatabaseImportError({ sourcePath, destinationPath, cause })),
+@@ -86,4 +98,21 @@ export const initializeV2Database = Effect.fn("initializeV2Database")(function*
+         : new V2DatabaseImportError({ sourcePath, destinationPath, cause }),
+     ),
    );
 +  // Threads created in a V1 build after the snapshot (a downgrade and
 +  // upgrade) would otherwise stay invisible. Best effort: never blocks startup.
 +  if (hadV2Database && (yield* fs.exists(sourcePath).pipe(Effect.orElseSucceed(() => false)))) {
-+    yield* Effect.try(() => resyncLegacyV1Threads(sourcePath, destinationPath)).pipe(
++    yield* Effect.try({
++      try: () => resyncLegacyV1Threads(sourcePath, destinationPath),
++      catch: (cause) => new LegacyV1ResyncError({ sourcePath, destinationPath, cause }),
++    }).pipe(
 +      Effect.tap((summary) =>
 +        summary.copiedThreadCount === 0 && summary.copiedProjectCount === 0
 +          ? Effect.void
