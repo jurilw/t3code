@@ -1,4 +1,4 @@
-From 86a9444ec490372779d537e6adf2f3808aec48c5 Mon Sep 17 00:00:00 2001
+From d1994faefe666fe745e2c700bdeb148d2f6889d7 Mon Sep 17 00:00:00 2001
 From: jurilw <washington.juri@gmail.com>
 Date: Sun, 25 Oct 2026 13:35:42 +0000
 Subject: [PATCH 2/3] feat(composer): local dictation through the desktop app
@@ -717,10 +717,10 @@ index 2dbc4eeda3..8dbfdb5671 100644
    onMenuAction: (listener) => {
      const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 1bd8d299ba..3b94e47cd7 100644
+index bba765d0e8..49f407a76f 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -204,6 +204,8 @@ import {
+@@ -208,6 +208,8 @@ import {
  } from "./ComposerAttachmentStrip";
  import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
  import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
@@ -729,7 +729,7 @@ index 1bd8d299ba..3b94e47cd7 100644
  import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
  import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
  import { buildPullRequestReferenceContext } from "../pullRequest/pullRequestDetail.logic";
-@@ -985,12 +987,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -995,12 +997,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
    const [composerMenuAnchor, setComposerMenuAnchor] = useState<HTMLDivElement | null>(null);
    const [hasWrappedPrompt, observeWrappedPrompt] = useComposerMultilinePrompt();
    const hasMultilinePrompt = prompt.includes("\n") || hasWrappedPrompt;
@@ -746,7 +746,7 @@ index 1bd8d299ba..3b94e47cd7 100644
      !hasMultilinePrompt &&
      pendingUserInputs.length === 0;
  
-@@ -2511,6 +2517,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -2523,6 +2529,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
      );
    };
    const insertComposerTextStable = useStableCallback(insertComposerText);
@@ -758,7 +758,7 @@ index 1bd8d299ba..3b94e47cd7 100644
  
    const insertAttachmentReferences = (
      references: ReadonlyArray<ComposerContextReference>,
-@@ -3565,6 +3576,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+@@ -3577,6 +3588,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                    >
                      {composerControls}
                    </div>
@@ -1795,10 +1795,10 @@ index 0000000000..3449f18f6e
 +  return useDictationSession().phase !== "idle";
 +}
 diff --git a/packages/contracts/src/ipc.ts b/packages/contracts/src/ipc.ts
-index 29be3d6d02..690273bfa2 100644
+index 39f96754a6..96d622f0f0 100644
 --- a/packages/contracts/src/ipc.ts
 +++ b/packages/contracts/src/ipc.ts
-@@ -1029,6 +1029,17 @@ export type DesktopMediaRead = typeof DesktopMediaReadSchema.Type;
+@@ -1032,6 +1032,17 @@ export type DesktopMediaRead = typeof DesktopMediaReadSchema.Type;
  export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
  export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
  
@@ -1816,7 +1816,7 @@ index 29be3d6d02..690273bfa2 100644
  export interface DesktopBridge {
    getAppBranding: () => DesktopAppBranding | null;
    getRelayTelemetryEnabled: () => boolean;
-@@ -1122,6 +1133,17 @@ export interface DesktopBridge {
+@@ -1125,6 +1136,17 @@ export interface DesktopBridge {
    openSystemSettings: (pane: SystemSettingsPane) => Promise<boolean>;
    checkSystemPermission: (pane: SystemSettingsPane) => Promise<boolean>;
    probeRemoteEditors: () => Promise<readonly EditorId[]>;
